@@ -59,3 +59,19 @@ def test_mockdaq_configure_validates_inputs():
         daq.configure(sample_rate=0, record_length=256)
     with pytest.raises(ValueError):
         daq.configure(sample_rate=1024, record_length=0)
+
+
+hardware = pytest.mark.skipif(
+    True, reason="requires PXIe-4464 hardware"
+)
+
+
+@hardware
+def test_pxie4464_configure_and_read():
+    from pxie4464_daq.device.daq import PXIe4464
+    with PXIe4464(device_name="Dev1") as daq:
+        daq.configure(sample_rate=51200, record_length=1024)
+        daq.start()
+        data = daq.read()
+        assert data.shape == (4, 1024)
+        assert data.dtype == np.float64
