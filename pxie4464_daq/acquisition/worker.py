@@ -1,18 +1,23 @@
 from __future__ import annotations
 import logging
+import threading
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QObject, pyqtSignal
 
 from pxie4464_daq.device.daq import _DAQBase
 
 logger = logging.getLogger(__name__)
 
 
-class AcquisitionWorker(QThread):
+class AcquisitionWorker(QObject):
     """백그라운드 연속 수집 스레드.
 
+    QThread 대신 Python 표준 threading.Thread를 사용한다.
+    QThread는 Python의 threading._active에 등록되지 않아 Python 3.14에서
+    logging 호출 시 threading.current_thread() → KeyError 연쇄 오류가 발생한다.
+
     Signals:
-        data_ready(object): shape (4, N) numpy 배열
+        data_ready(object): shape (n_channels, N) numpy 배열
         error_occurred(str): 오류 메시지
     """
 
@@ -23,9 +28,18 @@ class AcquisitionWorker(QThread):
         super().__init__(parent)
         self._daq = daq
         self._running = False
+        self._thread: threading.Thread | None = None
 
-    def run(self) -> None:
+    def start(self) -> None:
         self._running = True
+        self._thread = threading.Thread(
+            target=self._run,
+            name="AcquisitionWorker",
+            daemon=True,   # 앱 종료 시 스레드 자동 정리
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
         try:
             self._daq.start()
             while self._running:
@@ -42,4 +56,10 @@ class AcquisitionWorker(QThread):
 
     def stop(self) -> None:
         self._running = False
-        self.wait()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def isRunning(self) -> bool:
+        """main_window.py 호환용 — QThread.isRunning() 동일 인터페이스."""
+        return self._thread is not None and self._thread.is_alive()
