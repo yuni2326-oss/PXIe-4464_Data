@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
 from typing import List
 
@@ -8,6 +9,10 @@ from sklearn.ensemble import IsolationForest
 from PyQt5.QtCore import QObject, pyqtSignal
 
 logger = logging.getLogger(__name__)
+
+# Python 3.14 + PyQt5 SIP dispatch context에서 sklearn dataclass(Tags) __init__
+# 반환값 검사가 오작동함. sklearn 연산을 별도 Python 스레드에서 실행하여 우회.
+_sklearn_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sklearn")
 
 ZSCORE_WARNING = 3.0
 ZSCORE_ALARM = 5.0
@@ -52,7 +57,9 @@ class ChannelAnomalyDetector:
         self._zscore_max = float(np.max(zscores))
 
         # IsolationForest score_samples → 베이스라인 분포 대비 정규화 편차
-        if_raw = float(self._model.score_samples(features.reshape(1, -1))[0])
+        # SIP 컨텍스트 밖 스레드에서 실행 (Python 3.14 + PyQt5 SIP 호환성)
+        X = features.reshape(1, -1)
+        if_raw = float(_sklearn_pool.submit(self._model.score_samples, X).result(timeout=5.0)[0])
         self._norm_dev = (if_raw - self._score_mean) / self._score_std
 
         # 상태 결정 (AND 로직: 두 조건 모두 만족해야 낮은 심각도 유지)
@@ -90,9 +97,9 @@ class ChannelAnomalyDetector:
         self._mean = data.mean(axis=0)
         self._std = data.std(axis=0)
         self._model = IsolationForest(contamination=0.05, random_state=42)
-        self._model.fit(data)
-        # 베이스라인 score_samples 통계: 정규화 편차 계산 기준
-        baseline_scores = self._model.score_samples(data)
+        # fit과 score_samples 모두 SIP 컨텍스트 밖 스레드에서 실행
+        _sklearn_pool.submit(self._model.fit, data).result(timeout=30.0)
+        baseline_scores = _sklearn_pool.submit(self._model.score_samples, data).result(timeout=10.0)
         self._score_mean = float(baseline_scores.mean())
         self._score_std = float(baseline_scores.std()) + 1e-9
 
