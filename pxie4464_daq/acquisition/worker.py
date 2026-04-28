@@ -46,13 +46,28 @@ class AcquisitionWorker(QObject):
                 data = self._daq.read()
                 self.data_ready.emit(data)
         except Exception as exc:
-            logger.error("AcquisitionWorker error: %s", exc)
-            self.error_occurred.emit(str(exc))
+            # nidaqmx 내부 오류 메시지가 %d format 실패로 str(exc)를 던질 수 있음
+            # (화면보호기·절전 진입 시 장치 연결 끊김 케이스)
+            try:
+                msg = str(exc)
+            except Exception:
+                msg = f"{type(exc).__name__}: (오류 메시지 변환 실패 — 장치 연결 끊김 의심)"
+            try:
+                logger.error("AcquisitionWorker error: %s", msg)
+            except Exception:
+                pass
+            try:
+                self.error_occurred.emit(msg)
+            except Exception:
+                pass
         finally:
             try:
                 self._daq.stop()
             except Exception as exc:
-                logger.warning("DAQ stop error (ignored): %s", exc)
+                try:
+                    logger.warning("DAQ stop error (ignored): %s", exc)
+                except Exception:
+                    pass
 
     def stop(self) -> None:
         self._running = False

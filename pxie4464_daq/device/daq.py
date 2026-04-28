@@ -126,7 +126,7 @@ class PXIe4464(_DAQBase):
             source="OnboardClock",
             active_edge=Edge.RISING,
             sample_mode=AcquisitionType.CONTINUOUS,
-            samps_per_chan=self._record_length * 10,
+            samps_per_chan=self._record_length * 50,
         )
         self._buffer = np.zeros((N_CHANNELS_4464, self._record_length), dtype=np.float64)
         self._reader = AnalogMultiChannelReader(self._task.in_stream)
@@ -148,14 +148,17 @@ class PXIe4464(_DAQBase):
         if self._reader is None or self._buffer is None:
             raise RuntimeError("DAQ not started. Call start() first.")
         samps_read = self._reader.read_many_sample(
-            self._buffer, number_of_samples_per_channel=self._record_length
+            self._buffer, number_of_samples_per_channel=self._record_length, timeout=10.0
         )
+        # 화면보호기·절전 진입 시 nidaqmx가 None을 반환하는 경우 대비
+        if samps_read is None:
+            raise RuntimeError("PXIe4464: read_many_sample returned None — 장치 연결이 끊어졌을 수 있습니다.")
         if samps_read < self._record_length:
             logger.warning("Partial read: %d/%d samples. Retrying.", samps_read, self._record_length)
             samps_read = self._reader.read_many_sample(
-                self._buffer, number_of_samples_per_channel=self._record_length
+                self._buffer, number_of_samples_per_channel=self._record_length, timeout=10.0
             )
-            if samps_read < self._record_length:
+            if samps_read is None or samps_read < self._record_length:
                 raise RuntimeError(f"Partial read after retry: {samps_read}/{self._record_length}")
         return self._buffer.copy()
 
@@ -192,7 +195,7 @@ class PXIe4492(_DAQBase):
             source="OnboardClock",
             active_edge=Edge.RISING,
             sample_mode=AcquisitionType.CONTINUOUS,
-            samps_per_chan=self._record_length * 10,
+            samps_per_chan=self._record_length * 50,
         )
         self._buffer = np.zeros((N_CHANNELS_4492, self._record_length), dtype=np.float64)
         self._reader = AnalogMultiChannelReader(self._task.in_stream)
@@ -214,14 +217,16 @@ class PXIe4492(_DAQBase):
         if self._reader is None or self._buffer is None:
             raise RuntimeError("DAQ not started. Call start() first.")
         samps_read = self._reader.read_many_sample(
-            self._buffer, number_of_samples_per_channel=self._record_length
+            self._buffer, number_of_samples_per_channel=self._record_length, timeout=10.0
         )
+        if samps_read is None:
+            raise RuntimeError("PXIe4492: read_many_sample returned None — 장치 연결이 끊어졌을 수 있습니다.")
         if samps_read < self._record_length:
             logger.warning("Partial read: %d/%d samples. Retrying.", samps_read, self._record_length)
             samps_read = self._reader.read_many_sample(
-                self._buffer, number_of_samples_per_channel=self._record_length
+                self._buffer, number_of_samples_per_channel=self._record_length, timeout=10.0
             )
-            if samps_read < self._record_length:
+            if samps_read is None or samps_read < self._record_length:
                 raise RuntimeError(f"Partial read after retry: {samps_read}/{self._record_length}")
         return self._buffer.copy()
 
