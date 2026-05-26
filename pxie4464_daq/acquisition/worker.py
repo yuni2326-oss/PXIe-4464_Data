@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import queue as _queue
 import threading
 
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -8,13 +9,33 @@ from pxie4464_daq.device.daq import _DAQBase
 
 logger = logging.getLogger(__name__)
 
+# Python 3.14 + PyQt5 SIP 디스패치 컨텍스트에서 threading.Thread() 생성 자체가 실패함.
+# (threading.Thread.__init__ → Event() → Condition(Lock()) → TypeError)
+# 모듈 임포트 시점(SIP 컨텍스트 밖)에 실행자 스레드를 미리 생성하고
+# queue.Queue 로 작업을 전달하여 우회.
+_work_q: _queue.Queue = _queue.Queue()
+_done_q: _queue.Queue = _queue.Queue()
+
+
+def _acq_runner() -> None:
+    while True:
+        fn = _work_q.get()
+        if fn is None:
+            return
+        try:
+            fn()
+        finally:
+            _done_q.put(None)
+
+
+threading.Thread(target=_acq_runner, daemon=True, name="AcquisitionWorker").start()
+
 
 class AcquisitionWorker(QObject):
-    """백그라운드 연속 수집 스레드.
+    """백그라운드 연속 수집.
 
-    QThread 대신 Python 표준 threading.Thread를 사용한다.
-    QThread는 Python의 threading._active에 등록되지 않아 Python 3.14에서
-    logging 호출 시 threading.current_thread() → KeyError 연쇄 오류가 발생한다.
+    모듈 임포트 시 미리 생성된 실행자 스레드(_acq_runner)에 _run()을 큐로 전달.
+    SIP 디스패치 컨텍스트 안에서 threading 객체를 생성하지 않는다.
 
     Signals:
         data_ready(object): shape (n_channels, N) numpy 배열
@@ -28,16 +49,12 @@ class AcquisitionWorker(QObject):
         super().__init__(parent)
         self._daq = daq
         self._running = False
-        self._thread: threading.Thread | None = None
+        self._started = False
 
     def start(self) -> None:
         self._running = True
-        self._thread = threading.Thread(
-            target=self._run,
-            name="AcquisitionWorker",
-            daemon=True,   # 앱 종료 시 스레드 자동 정리
-        )
-        self._thread.start()
+        self._started = True
+        _work_q.put(self._run)
 
     def _run(self) -> None:
         try:
@@ -46,8 +63,6 @@ class AcquisitionWorker(QObject):
                 data = self._daq.read()
                 self.data_ready.emit(data)
         except Exception as exc:
-            # nidaqmx 내부 오류 메시지가 %d format 실패로 str(exc)를 던질 수 있음
-            # (화면보호기·절전 진입 시 장치 연결 끊김 케이스)
             try:
                 msg = str(exc)
             except Exception:
@@ -71,10 +86,13 @@ class AcquisitionWorker(QObject):
 
     def stop(self) -> None:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            self._thread = None
+        if self._started:
+            self._started = False
+            try:
+                _done_q.get(timeout=5.0)
+            except Exception:
+                pass
 
     def isRunning(self) -> bool:
         """main_window.py 호환용 — QThread.isRunning() 동일 인터페이스."""
-        return self._thread is not None and self._thread.is_alive()
+        return self._running
