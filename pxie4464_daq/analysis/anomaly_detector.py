@@ -15,17 +15,26 @@ logger = logging.getLogger(__name__)
 # (submit() → Future() → threading.Condition() → TypeError)
 # 모듈 임포트 시점(SIP 컨텍스트 밖)에 queue.Queue와 sklearn 전용 스레드를 미리 생성.
 # SIP 컨텍스트 안에서는 put()/get()만 호출하며, 새로운 threading 객체를 생성하지 않는다.
+#
+# [큐 안전성 설계]
+# 공유 응답 큐(_SKL_RES)를 사용하면 timeout 발생 시 stale 결과가 남아
+# 이후 호출이 잘못된 결과를 받는 버그가 있다.
+# 해결: 모듈 임포트 시점에 _N_RQ개의 결과 큐를 미리 생성(SIP 밖 → 안전).
+# 각 호출은 순환 방식으로 전용 큐를 배정받으므로 timeout이 발생해도
+# stale 결과가 다음 호출에 영향을 주지 않는다.
+_N_RQ = 64  # 순환 풀 크기 (동시 호출은 1개이므로 64면 충분)
 _SKL_REQ: _queue.Queue = _queue.Queue()
-_SKL_RES: _queue.Queue = _queue.Queue()
+_SKL_RESULT_POOL: list = [_queue.Queue() for _ in range(_N_RQ)]
+_rq_index: int = 0
 
 
 def _sklearn_loop() -> None:
     while True:
-        fn, args = _SKL_REQ.get()
+        fn, args, rq = _SKL_REQ.get()
         try:
-            _SKL_RES.put(('ok', fn(*args)))
+            rq.put(('ok', fn(*args)))
         except Exception as e:
-            _SKL_RES.put(('err', e))
+            rq.put(('err', e))
 
 
 threading.Thread(target=_sklearn_loop, daemon=True, name="sklearn").start()
@@ -33,8 +42,23 @@ threading.Thread(target=_sklearn_loop, daemon=True, name="sklearn").start()
 
 def _call_sklearn(fn, *args, timeout: float = 30.0):
     """sklearn 함수를 SIP 컨텍스트 밖 스레드에서 실행하고 결과를 동기적으로 반환."""
-    _SKL_REQ.put((fn, args))
-    status, value = _SKL_RES.get(timeout=timeout)
+    global _rq_index
+    rq = _SKL_RESULT_POOL[_rq_index % _N_RQ]
+    _rq_index += 1
+
+    # 64회 전에 timeout이 발생했을 경우 stale 결과를 제거
+    while not rq.empty():
+        try:
+            rq.get_nowait()
+        except _queue.Empty:
+            break
+
+    _SKL_REQ.put((fn, args, rq))
+    try:
+        status, value = rq.get(timeout=timeout)
+    except _queue.Empty:
+        logger.error("sklearn 호출 timeout (%.1fs) — 채널 업데이트 건너뜀", timeout)
+        raise TimeoutError(f"sklearn timed out after {timeout}s")
     if status == 'err':
         raise value
     return value
@@ -139,7 +163,16 @@ class AnomalyDetector(QObject):
 
     def update(self, features: np.ndarray) -> List[State]:
         """features: shape (n_channels, N_FEATURES)"""
-        states = [self._detectors[ch].update(features[ch]) for ch in range(len(self._detectors))]
+        states = []
+        for ch in range(len(self._detectors)):
+            try:
+                states.append(self._detectors[ch].update(features[ch]))
+            except TimeoutError:
+                # sklearn timeout — 이전 상태 유지하고 계속 진행
+                states.append(self._detectors[ch].state)
+            except Exception as exc:
+                logger.error("CH%d 이상감지 업데이트 오류 (건너뜀): %s", ch, exc)
+                states.append(self._detectors[ch].state)
         self.state_changed.emit(states)
         return states
 

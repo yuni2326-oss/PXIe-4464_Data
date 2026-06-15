@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton, QCheckBox,
     QComboBox, QMessageBox, QGridLayout, QScrollArea
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 
 from pxie4464_daq.device.daq import (
     MockDAQ, PXIe4464, PXIe4492, MultiDAQ, _DAQBase,
@@ -46,6 +46,7 @@ class MainWindow(QMainWindow):
         self._last_mags: Optional[List] = None
         self._enabled_indices: List[int] = list(range(N_CHANNELS_4464))  # 초기: 4464 4채널
         self._setup_ui()
+        self._start_heartbeat()
 
     # ── UI 구성 ─────────────────────────────────────────────────────────────
 
@@ -196,6 +197,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._save_btn)
         return w
 
+    # ── Heartbeat ───────────────────────────────────────────────────────────
+
+    def _start_heartbeat(self) -> None:
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(3600 * 1000)  # 1시간마다
+        self._heartbeat_timer.timeout.connect(self._on_heartbeat)
+        self._heartbeat_timer.start()
+
+    def _on_heartbeat(self) -> None:
+        try:
+            worker_state = "running" if (self._worker and self._worker.isRunning()) else "stopped"
+            save_count = getattr(self._data_saver, "_save_count", 0) if self._data_saver else 0
+            last_save = (
+                self._data_saver._last_save_time.strftime("%H:%M:%S")
+                if (self._data_saver and self._data_saver._last_save_time)
+                else "없음"
+            )
+            logger.info(
+                "[Heartbeat] worker=%s | DAQ=%s | 저장횟수=%d | 마지막저장=%s",
+                worker_state,
+                type(self._daq).__name__ if self._daq else "None",
+                save_count,
+                last_save,
+            )
+        except Exception as exc:
+            logger.warning("[Heartbeat] 상태 기록 실패: %s", exc)
+
     # ── 슬롯 ────────────────────────────────────────────────────────────────
 
     def _on_4492_toggled(self, checked: bool) -> None:
@@ -289,6 +317,7 @@ class MainWindow(QMainWindow):
         self._worker.start()
         self._start_btn.setText("■ 정지")
         self._save_btn.setEnabled(True)
+        logger.info("수집 시작: DAQ=%s, 채널=%s", type(self._daq).__name__, self._enabled_indices)
 
     def _stop_acquisition(self):
         if self._worker:
@@ -297,6 +326,7 @@ class MainWindow(QMainWindow):
         if self._collector:
             self._collector.stop()
         self._start_btn.setText("▶ 시작")
+        logger.info("수집 정지")
 
     def _on_data_ready(self, data: np.ndarray):
         # 활성 채널만 필터링
@@ -322,6 +352,7 @@ class MainWindow(QMainWindow):
             self._anomaly_plot.update(self._detector.if_scores(), self._enabled_indices)
 
     def _on_error(self, msg: str):
+        logger.error("DAQ 수집 오류 발생: %s", msg)
         QMessageBox.critical(self, "수집 오류", msg)
         self._stop_acquisition()
 

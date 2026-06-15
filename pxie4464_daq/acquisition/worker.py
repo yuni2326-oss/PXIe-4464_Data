@@ -52,9 +52,16 @@ class AcquisitionWorker(QObject):
         self._started = False
 
     def start(self) -> None:
+        # 이전 stop() timeout으로 남은 stale 완료 신호를 제거
+        while not _done_q.empty():
+            try:
+                _done_q.get_nowait()
+            except _queue.Empty:
+                break
         self._running = True
         self._started = True
         _work_q.put(self._run)
+        logger.info("AcquisitionWorker 시작")
 
     def _run(self) -> None:
         try:
