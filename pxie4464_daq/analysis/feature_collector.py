@@ -30,6 +30,10 @@ class FeatureCollector(QObject):
         self._window_samples = int(sample_rate * window_sec)
         # 채널별 rolling buffer (deque로 자동 truncation)
         self._buffers = [deque(maxlen=self._window_samples) for _ in range(n_channels)]
+        # stale 가드: 수집 누적 샘플 수를 추적해, 직전 추출 이후 새 데이터가
+        # 들어오지 않았으면(수집 정지) 멈춘 버퍼 저장을 건너뛴다.
+        self._samples_received = 0
+        self._samples_at_last_extract = -1
         self._timer = QTimer(self)
         self._timer.setInterval(int(collection_cycle_sec * 1000))
         self._timer.timeout.connect(self._extract_and_emit)
@@ -44,8 +48,19 @@ class FeatureCollector(QObject):
         """AcquisitionWorker.data_ready 시그널 슬롯. data: (n_channels, N)"""
         for ch in range(self._n_channels):
             self._buffers[ch].extend(data[ch].tolist())
+        self._samples_received += int(data.shape[1])
 
     def _extract_and_emit(self) -> None:
+        # stale 가드: 직전 추출 이후 새 데이터가 한 건도 안 들어왔으면
+        # 수집이 멈춘 것이므로 멈춘 버퍼를 추출·저장하지 않는다.
+        if self._samples_received == self._samples_at_last_extract:
+            logger.warning(
+                "새 데이터 없음(누적 %d 샘플 정체) — 수집 정지 추정. 추출·저장 건너뜀.",
+                self._samples_received,
+            )
+            return
+        self._samples_at_last_extract = self._samples_received
+
         ts = datetime.now()
         features_all = np.zeros((self._n_channels, N_FEATURES), dtype=np.float64)
         raw_arrays = []

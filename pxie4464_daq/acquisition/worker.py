@@ -70,6 +70,10 @@ class AcquisitionWorker(QObject):
                 data = self._daq.read()
                 self.data_ready.emit(data)
         except Exception as exc:
+            # 오류 발생 → 워커는 더 이상 데이터를 공급하지 않음.
+            # isRunning()이 즉시 False를 반환하도록 플래그를 내려
+            # Heartbeat "running" 오보 및 멈춘 버퍼 저장을 방지한다.
+            self._running = False
             try:
                 msg = str(exc)
             except Exception:

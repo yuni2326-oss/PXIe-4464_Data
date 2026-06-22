@@ -353,8 +353,28 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg: str):
         logger.error("DAQ 수집 오류 발생: %s", msg)
-        QMessageBox.critical(self, "수집 오류", msg)
+        # ① 정지를 먼저 실행한다. (모달창이 정지 로직을 막아 멈춘 버퍼가
+        #    계속 저장되던 버그 방지 — 무인 운전 시 치명적)
         self._stop_acquisition()
+        # ② 알림은 비모달로 표시한다. exec_()/모달은 이벤트 루프를 블록하여
+        #    무인 운전 중 OK 클릭이 없으면 앱 로직이 영구 정지된다.
+        self._show_error_nonmodal(msg)
+
+    def _show_error_nonmodal(self, msg: str) -> None:
+        """비차단(non-modal) 오류 알림. 반복 오류는 기존 창 텍스트만 갱신."""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        full = f"[{ts}] 수집이 중단되었습니다.\n\n{msg}"
+        box = getattr(self, "_error_box", None)
+        if box is None:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Critical)
+            box.setWindowTitle("수집 오류")
+            box.setStandardButtons(QMessageBox.Ok)
+            box.setModal(False)  # 비모달 — 이벤트 루프를 막지 않음
+            self._error_box = box
+        box.setText(full)
+        box.show()
+        box.raise_()
 
     def _on_save_csv(self):
         if self._last_data is None:
