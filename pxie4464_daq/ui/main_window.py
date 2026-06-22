@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 VOLTAGE_RANGES = [1.0, 3.16, 10.0, 31.6]
 N_TOTAL_MAX = N_CHANNELS_4464 + N_CHANNELS_4492  # 12
 
+# 자동 재시작 백오프 파라미터
+RESTART_BASE_SEC = 5       # 첫 재시도 지연
+RESTART_MAX_SEC = 300      # 지연 상한 (5분)
+STABLE_RESET_SEC = 120     # 이 시간 무오류 운전 시 재시도 카운터 초기화
+
 
 class MainWindow(QMainWindow):
     def __init__(self, parent=None):
@@ -45,7 +50,19 @@ class MainWindow(QMainWindow):
         self._last_freqs: Optional[List] = None
         self._last_mags: Optional[List] = None
         self._enabled_indices: List[int] = list(range(N_CHANNELS_4464))  # 초기: 4464 4채널
+        self._active_sample_rate: Optional[float] = None  # 현재 가동 중인 샘플레이트(위젯 편집과 분리)
+
+        # 자동 재시작(워치독): DAQ 오류 시 초기 실행조건 그대로 재연결+재시작
+        self._start_config: Optional[dict] = None   # 초기 실행조건 스냅샷
+        self._auto_restart_enabled: bool = True
+        self._restart_attempts: int = 0
         self._setup_ui()
+        self._restart_timer = QTimer(self)
+        self._restart_timer.setSingleShot(True)
+        self._restart_timer.timeout.connect(self._attempt_restart)
+        self._stable_timer = QTimer(self)
+        self._stable_timer.setSingleShot(True)
+        self._stable_timer.timeout.connect(self._on_stable)
         self._start_heartbeat()
 
     # ── UI 구성 ─────────────────────────────────────────────────────────────
@@ -192,9 +209,13 @@ class MainWindow(QMainWindow):
         self._save_btn = QPushButton("CSV 저장")
         self._save_btn.setEnabled(False)
         self._save_btn.clicked.connect(self._on_save_csv)
+        self._auto_restart_check = QCheckBox("오류 시 자동 재시작")
+        self._auto_restart_check.setChecked(True)
+        self._auto_restart_check.toggled.connect(self._on_auto_restart_toggled)
         layout.addWidget(self._connect_btn)
         layout.addWidget(self._start_btn)
         layout.addWidget(self._save_btn)
+        layout.addWidget(self._auto_restart_check)
         return w
 
     # ── Heartbeat ───────────────────────────────────────────────────────────
@@ -231,77 +252,95 @@ class MainWindow(QMainWindow):
         for i in range(N_CHANNELS_4492):
             self._ch_checks[N_CHANNELS_4464 + i].setEnabled(checked)
 
+    def _read_config(self) -> dict:
+        """현재 UI 위젯 값을 초기 실행조건 스냅샷(dict)으로 읽는다."""
+        use_4492 = self._use_4492_check.isChecked()
+        n_total = N_CHANNELS_4464 + (N_CHANNELS_4492 if use_4492 else 0)
+        enabled = [i for i in range(n_total) if self._ch_checks[i].isChecked()]
+        return {
+            "sample_rate": float(self._sample_rate_edit.text()),
+            "chunk": int(self._chunk_edit.text()),
+            "voltage_range": self._voltage_combo.currentData(),
+            "cycle_sec": float(self._cycle_sec_edit.text()),
+            "window_sec": float(self._window_sec_edit.text()),
+            "baseline_count": int(self._baseline_count_edit.text()),
+            "save_interval_sec": float(self._save_interval_edit.text()) * 60.0,
+            "use_4492": use_4492,
+            "mock": self._mock_check.isChecked(),
+            "dev4464": self._dev4464_edit.text(),
+            "dev4492": self._dev4492_edit.text(),
+            "enabled_indices": enabled,
+        }
+
+    def _build_pipeline(self, cfg: dict) -> None:
+        """설정 스냅샷(cfg)으로 DAQ·플롯·분석 파이프라인을 구성한다.
+
+        UI 대화창을 띄우지 않고 실패 시 예외를 올린다. 수동 연결과
+        자동 재시작이 동일한 코드로 '초기 실행조건 그대로' 재구성된다.
+        """
+        if not cfg["enabled_indices"]:
+            raise ValueError("활성화된 채널이 없습니다.")
+        self._enabled_indices = list(cfg["enabled_indices"])
+        n_active = len(self._enabled_indices)
+        sample_rate = cfg["sample_rate"]
+        self._active_sample_rate = sample_rate
+
+        # DAQ 장치 생성
+        if cfg["mock"]:
+            daq_4464 = MockDAQ(n_channels=N_CHANNELS_4464)
+            if cfg["use_4492"]:
+                self._daq = MultiDAQ(daq_4464, MockDAQ(n_channels=N_CHANNELS_4492))
+            else:
+                self._daq = daq_4464
+        else:
+            daq_4464 = PXIe4464(device_name=cfg["dev4464"])
+            if cfg["use_4492"]:
+                daq_4492 = PXIe4492(device_name=cfg["dev4492"],
+                                    voltage_range=cfg["voltage_range"])
+                self._daq = MultiDAQ(daq_4464, daq_4492)
+            else:
+                self._daq = daq_4464
+
+        self._daq.configure(sample_rate=sample_rate, record_length=cfg["chunk"],
+                            voltage_range=cfg["voltage_range"])
+
+        # 플롯 재구성
+        self._waveform_plot._sample_rate = sample_rate
+        self._waveform_plot.reconfigure(self._enabled_indices)
+        self._fft_plot.reconfigure(self._enabled_indices)
+        self._anomaly_plot.reconfigure(self._enabled_indices)
+        self._status_light.reconfigure(self._enabled_indices)
+
+        # 분석 파이프라인 생성
+        self._collector = FeatureCollector(
+            sample_rate=sample_rate,
+            collection_cycle_sec=cfg["cycle_sec"],
+            window_sec=cfg["window_sec"],
+            n_channels=n_active,
+        )
+        self._detector = AnomalyDetector(n_channels=n_active, baseline_count=cfg["baseline_count"])
+        self._detector.state_changed.connect(self._on_state_changed)
+        self._collector.features_ready.connect(self._detector.update)
+
+        self._data_saver = DataSaver(sample_rate=sample_rate, save_dir="results",
+                                     save_interval_sec=cfg["save_interval_sec"])
+        self._collector.raw_ready.connect(self._data_saver.on_raw)
+        logger.info("파이프라인 구성: %s, 활성 채널=%s, sr=%.0f",
+                    type(self._daq).__name__, self._enabled_indices, sample_rate)
+
     def _on_connect(self):
         try:
-            sample_rate = float(self._sample_rate_edit.text())
-            chunk = int(self._chunk_edit.text())
-            voltage_range = self._voltage_combo.currentData()
-            cycle_sec = float(self._cycle_sec_edit.text())
-            window_sec = float(self._window_sec_edit.text())
-            baseline_count = int(self._baseline_count_edit.text())
-            save_interval_sec = float(self._save_interval_edit.text()) * 60.0
-            use_4492 = self._use_4492_check.isChecked()
-            mock = self._mock_check.isChecked()
-
-            # 활성 채널 인덱스 계산
-            n_total = N_CHANNELS_4464 + (N_CHANNELS_4492 if use_4492 else 0)
-            self._enabled_indices = [
-                i for i in range(n_total) if self._ch_checks[i].isChecked()
-            ]
-            if not self._enabled_indices:
-                QMessageBox.warning(self, "설정 오류", "활성화된 채널이 없습니다.")
-                return
-            n_active = len(self._enabled_indices)
-
-            # DAQ 장치 생성
-            if mock:
-                daq_4464 = MockDAQ(n_channels=N_CHANNELS_4464)
-                if use_4492:
-                    daq_4492 = MockDAQ(n_channels=N_CHANNELS_4492)
-                    self._daq = MultiDAQ(daq_4464, daq_4492)
-                else:
-                    self._daq = daq_4464
-            else:
-                daq_4464 = PXIe4464(device_name=self._dev4464_edit.text())
-                if use_4492:
-                    daq_4492 = PXIe4492(device_name=self._dev4492_edit.text(),
-                                        voltage_range=voltage_range)
-                    self._daq = MultiDAQ(daq_4464, daq_4492)
-                else:
-                    self._daq = daq_4464
-
-            self._daq.configure(sample_rate=sample_rate, record_length=chunk,
-                                voltage_range=voltage_range)
-
-            # 플롯 재구성
-            self._waveform_plot._sample_rate = sample_rate
-            self._waveform_plot.reconfigure(self._enabled_indices)
-            self._fft_plot.reconfigure(self._enabled_indices)
-            self._anomaly_plot.reconfigure(self._enabled_indices)
-            self._status_light.reconfigure(self._enabled_indices)
-
-            # 분석 파이프라인 생성
-            self._collector = FeatureCollector(
-                sample_rate=sample_rate,
-                collection_cycle_sec=cycle_sec,
-                window_sec=window_sec,
-                n_channels=n_active,
-            )
-            self._detector = AnomalyDetector(n_channels=n_active, baseline_count=baseline_count)
-            self._detector.state_changed.connect(self._on_state_changed)
-            self._collector.features_ready.connect(self._detector.update)
-
-            self._data_saver = DataSaver(sample_rate=sample_rate, save_dir="results",
-                                         save_interval_sec=save_interval_sec)
-            self._collector.raw_ready.connect(self._data_saver.on_raw)
-
-            self._start_btn.setEnabled(True)
-            self._connect_btn.setEnabled(False)
-            logger.info("연결 완료: %s, 활성 채널=%s, sr=%.0f",
-                        type(self._daq).__name__, self._enabled_indices, sample_rate)
-
+            cfg = self._read_config()
+            self._build_pipeline(cfg)
         except Exception as exc:
             QMessageBox.critical(self, "연결 오류", str(exc))
+            return
+        self._start_config = cfg          # 초기 실행조건 스냅샷 저장
+        self._restart_attempts = 0
+        self._start_btn.setEnabled(True)
+        self._connect_btn.setEnabled(False)
+        logger.info("연결 완료 (자동 재시작 %s)",
+                    "ON" if self._auto_restart_enabled else "OFF")
 
     def _on_start_stop(self):
         if self._worker is None or not self._worker.isRunning():
@@ -319,14 +358,20 @@ class MainWindow(QMainWindow):
         self._save_btn.setEnabled(True)
         logger.info("수집 시작: DAQ=%s, 채널=%s", type(self._daq).__name__, self._enabled_indices)
 
-    def _stop_acquisition(self):
+    def _stop_acquisition(self, manual: bool = True):
+        # 수동 정지(버튼/종료)는 자동 재시작 사이클도 함께 취소한다.
+        # 오류 정지(manual=False)는 호출자가 재시작을 예약하므로 취소하지 않는다.
+        if manual:
+            self._restart_timer.stop()
+            self._stable_timer.stop()
+            self._restart_attempts = 0
         if self._worker:
             self._worker.stop()
             self._worker = None
         if self._collector:
             self._collector.stop()
         self._start_btn.setText("▶ 시작")
-        logger.info("수집 정지")
+        logger.info("수집 정지%s", "" if manual else " (오류)")
 
     def _on_data_ready(self, data: np.ndarray):
         # 활성 채널만 필터링
@@ -334,7 +379,7 @@ class MainWindow(QMainWindow):
         self._last_data = filtered
         self._waveform_plot.update(filtered, self._enabled_indices)
 
-        sample_rate = float(self._sample_rate_edit.text())
+        sample_rate = self._active_sample_rate or float(self._sample_rate_edit.text())
         freqs_list, mags_list = [], []
         for ch_data in filtered:
             freqs, mags = compute_fft(ch_data, sample_rate)
@@ -355,10 +400,13 @@ class MainWindow(QMainWindow):
         logger.error("DAQ 수집 오류 발생: %s", msg)
         # ① 정지를 먼저 실행한다. (모달창이 정지 로직을 막아 멈춘 버퍼가
         #    계속 저장되던 버그 방지 — 무인 운전 시 치명적)
-        self._stop_acquisition()
+        self._stop_acquisition(manual=False)
         # ② 알림은 비모달로 표시한다. exec_()/모달은 이벤트 루프를 블록하여
         #    무인 운전 중 OK 클릭이 없으면 앱 로직이 영구 정지된다.
         self._show_error_nonmodal(msg)
+        # ③ 자동 재시작 예약 (초기 실행조건 그대로)
+        if self._auto_restart_enabled and self._start_config is not None:
+            self._schedule_restart()
 
     def _show_error_nonmodal(self, msg: str) -> None:
         """비차단(non-modal) 오류 알림. 반복 오류는 기존 창 텍스트만 갱신."""
@@ -376,12 +424,51 @@ class MainWindow(QMainWindow):
         box.show()
         box.raise_()
 
+    # ── 자동 재시작 (워치독) ─────────────────────────────────────────────────
+
+    def _on_auto_restart_toggled(self, checked: bool) -> None:
+        self._auto_restart_enabled = checked
+        if not checked:
+            self._restart_timer.stop()
+        logger.info("자동 재시작 %s", "활성화" if checked else "비활성화")
+
+    def _schedule_restart(self) -> None:
+        """지수 백오프로 재시작을 예약한다 (상한 RESTART_MAX_SEC)."""
+        self._restart_attempts += 1
+        delay = min(RESTART_BASE_SEC * (2 ** (self._restart_attempts - 1)), RESTART_MAX_SEC)
+        logger.warning("[자동재시작] %d초 후 재시도 예약 (누적 시도 #%d)",
+                       delay, self._restart_attempts)
+        self._restart_timer.start(int(delay * 1000))
+
+    def _attempt_restart(self) -> None:
+        """초기 실행조건 스냅샷으로 재연결 후 수집을 재개한다."""
+        if not self._auto_restart_enabled or self._start_config is None:
+            return
+        logger.info("[자동재시작] 시도 #%d — 초기 실행조건으로 재연결", self._restart_attempts)
+        try:
+            self._build_pipeline(self._start_config)
+        except Exception as exc:
+            logger.warning("[자동재시작] 재연결 실패 (#%d): %s — 재예약",
+                           self._restart_attempts, exc)
+            self._schedule_restart()
+            return
+        self._start_acquisition()
+        logger.info("[자동재시작] 성공 (#%d). %d초 무오류 시 카운터 초기화",
+                    self._restart_attempts, STABLE_RESET_SEC)
+        self._stable_timer.start(STABLE_RESET_SEC * 1000)
+
+    def _on_stable(self) -> None:
+        if self._restart_attempts:
+            logger.info("[자동재시작] %d초 안정 운전 확인 — 재시도 카운터 초기화",
+                        STABLE_RESET_SEC)
+        self._restart_attempts = 0
+
     def _on_save_csv(self):
         if self._last_data is None:
             QMessageBox.warning(self, "저장 실패", "저장할 데이터가 없습니다.")
             return
         ts = datetime.now()
-        sample_rate = float(self._sample_rate_edit.text())
+        sample_rate = self._active_sample_rate or float(self._sample_rate_edit.text())
         try:
             save_raw(self._last_data, sample_rate=sample_rate, timestamp=ts)
             if self._last_freqs and self._last_mags:
