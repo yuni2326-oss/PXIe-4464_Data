@@ -17,3 +17,7 @@ venv/
 *.user
 .DS_Store
 Thumbs.db
+
+# 런타임 산출물 (로그·수집 데이터)
+logs/
+results/
