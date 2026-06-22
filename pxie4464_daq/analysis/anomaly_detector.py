@@ -1,74 +1,30 @@
 from __future__ import annotations
 import logging
-import queue as _queue
-import threading
 from enum import Enum, auto
 from typing import List
 
 import numpy as np
-from sklearn.ensemble import IsolationForest
 from PyQt5.QtCore import QObject, pyqtSignal
 
 logger = logging.getLogger(__name__)
 
-# Python 3.14 + PyQt5 SIP 디스패치 컨텍스트에서 ThreadPoolExecutor.submit()이 실패함.
-# (submit() → Future() → threading.Condition() → TypeError)
-# 모듈 임포트 시점(SIP 컨텍스트 밖)에 queue.Queue와 sklearn 전용 스레드를 미리 생성.
-# SIP 컨텍스트 안에서는 put()/get()만 호출하며, 새로운 threading 객체를 생성하지 않는다.
+# [Python 3.14 호환성 이력]
+# 이전 버전은 sklearn IsolationForest.score_samples 를 사용했으나,
+# Python 3.14 + PyQt5 SIP 디스패치 컨텍스트에서 sklearn 내부 __init__ 호출이
+# "__init__() should return None, not 'NoneType'" 오류로 매 사이클·매 채널 100% 실패했다.
+# (worker 스레드 우회도 효과 없었음 → 로그상 33,744건/일 에러)
 #
-# [큐 안전성 설계]
-# 공유 응답 큐(_SKL_RES)를 사용하면 timeout 발생 시 stale 결과가 남아
-# 이후 호출이 잘못된 결과를 받는 버그가 있다.
-# 해결: 모듈 임포트 시점에 _N_RQ개의 결과 큐를 미리 생성(SIP 밖 → 안전).
-# 각 호출은 순환 방식으로 전용 큐를 배정받으므로 timeout이 발생해도
-# stale 결과가 다음 호출에 영향을 주지 않는다.
-_N_RQ = 64  # 순환 풀 크기 (동시 호출은 1개이므로 64면 충분)
-_SKL_REQ: _queue.Queue = _queue.Queue()
-_SKL_RESULT_POOL: list = [_queue.Queue() for _ in range(_N_RQ)]
-_rq_index: int = 0
-
-
-def _sklearn_loop() -> None:
-    while True:
-        fn, args, rq = _SKL_REQ.get()
-        try:
-            rq.put(('ok', fn(*args)))
-        except Exception as e:
-            rq.put(('err', e))
-
-
-threading.Thread(target=_sklearn_loop, daemon=True, name="sklearn").start()
-
-
-def _call_sklearn(fn, *args, timeout: float = 30.0):
-    """sklearn 함수를 SIP 컨텍스트 밖 스레드에서 실행하고 결과를 동기적으로 반환."""
-    global _rq_index
-    rq = _SKL_RESULT_POOL[_rq_index % _N_RQ]
-    _rq_index += 1
-
-    # 64회 전에 timeout이 발생했을 경우 stale 결과를 제거
-    while not rq.empty():
-        try:
-            rq.get_nowait()
-        except _queue.Empty:
-            break
-
-    _SKL_REQ.put((fn, args, rq))
-    try:
-        status, value = rq.get(timeout=timeout)
-    except _queue.Empty:
-        logger.error("sklearn 호출 timeout (%.1fs) — 채널 업데이트 건너뜀", timeout)
-        raise TimeoutError(f"sklearn timed out after {timeout}s")
-    if status == 'err':
-        raise value
-    return value
-
+# numpy 연산은 동일 컨텍스트에서 정상 동작함이 검증되어,
+# 이상도 지표를 sklearn IsolationForest → 정규화 마할라노비스 거리(순수 numpy)로 교체.
+# 마할라노비스 거리는 특징 간 상관구조를 반영하므로, 단일 특징 Z-score가 놓치는
+# 다특징 확산 드리프트(펌프 열화 등)도 포착한다.
 
 ZSCORE_WARNING = 3.0
 ZSCORE_ALARM = 5.0
-NORM_DEV_WARNING = -2.0  # 베이스라인 score_samples 분포 대비 정규화 편차 임계값
+NORM_DEV_WARNING = -2.0  # 베이스라인 거리분포 대비 정규화 편차 임계값 (낮을수록 이상)
 NORM_DEV_ALARM = -3.0
-WARNING_HOLDOFF = 3      # 연속 n회 이상 판정 시에만 WARNING 발동
+WARNING_HOLDOFF = 3      # 연속 n회 이상 판정 시에만 WARNING/ALARM 발동
+_COV_RIDGE = 1e-3        # 공분산 정칙화 계수 (소표본·특이행렬 대비)
 
 
 class State(Enum):
@@ -79,18 +35,18 @@ class State(Enum):
 
 
 class ChannelAnomalyDetector:
-    """단일 채널 이상 감지기."""
+    """단일 채널 이상 감지기 (Z-score + 정규화 마할라노비스 거리)."""
 
     def __init__(self, baseline_count: int = 20):
         self._baseline_count = baseline_count
         self._baseline: list = []
-        self._model: IsolationForest | None = None
         self._mean: np.ndarray | None = None
         self._std: np.ndarray | None = None
-        self._score_mean: float = 0.0   # 베이스라인 score_samples 평균
-        self._score_std: float = 1.0    # 베이스라인 score_samples 표준편차
+        self._cov_inv: np.ndarray | None = None   # 정칙화된 공분산 역행렬
+        self._dist_mean: float = 0.0              # 베이스라인 마할라노비스 거리 평균
+        self._dist_std: float = 1.0               # 베이스라인 마할라노비스 거리 표준편차
         self.state: State = State.LEARNING
-        self._norm_dev: float = 0.0     # 정규화 편차 (IF 이상도 지표)
+        self._norm_dev: float = 0.0               # 정규화 편차 (이상도 지표, 낮을수록 이상)
         self._zscore_max: float = 0.0
         self._warning_streak: int = 0
 
@@ -102,16 +58,16 @@ class ChannelAnomalyDetector:
                 self.state = State.NORMAL
             return self.state
 
-        # Z-score 계산
+        # Z-score (특징별 편차의 최대값) — 단일 특징 스파이크 포착
         zscores = np.abs((features - self._mean) / (self._std + 1e-10))
         self._zscore_max = float(np.max(zscores))
 
-        # IsolationForest score_samples → 베이스라인 분포 대비 정규화 편차
-        X = features.reshape(1, -1)
-        if_raw = float(_call_sklearn(self._model.score_samples, X, timeout=5.0)[0])
-        self._norm_dev = (if_raw - self._score_mean) / self._score_std
+        # 정규화 마할라노비스 거리 — 다특징 상관 드리프트 포착
+        dist = self._mahalanobis(features)
+        # 거리가 클수록 이상 → 부호 반전하여 "낮을수록 이상" 규약 유지 (기존 임계값 호환)
+        self._norm_dev = -(dist - self._dist_mean) / self._dist_std
 
-        # 상태 결정 (AND 로직: 두 조건 모두 만족해야 낮은 심각도 유지)
+        # 상태 결정 (AND 로직: 두 지표 모두 정상 범위여야 낮은 심각도 유지)
         if self._zscore_max < ZSCORE_WARNING and self._norm_dev > NORM_DEV_WARNING:
             new_state = State.NORMAL
         elif self._zscore_max < ZSCORE_ALARM and self._norm_dev > NORM_DEV_ALARM:
@@ -119,7 +75,7 @@ class ChannelAnomalyDetector:
         else:
             new_state = State.ALARM
 
-        # 홀드오프: WARNING/ALARM 3회 연속이어야 발동
+        # 홀드오프: WARNING/ALARM 연속 n회여야 발동 (순간 노이즈 무시)
         if new_state in (State.WARNING, State.ALARM):
             self._warning_streak += 1
         else:
@@ -134,22 +90,36 @@ class ChannelAnomalyDetector:
 
     @property
     def if_score(self) -> float:
-        """베이스라인 대비 정규화 편차 (낮을수록 이상)."""
+        """베이스라인 대비 정규화 편차 (낮을수록 이상). 호환을 위해 이름 유지."""
         return self._norm_dev
 
     @property
     def zscore_max(self) -> float:
         return self._zscore_max
 
+    def _mahalanobis(self, x: np.ndarray) -> float:
+        diff = x - self._mean
+        d2 = float(diff @ self._cov_inv @ diff)
+        return float(np.sqrt(max(d2, 0.0)))
+
     def _fit_model(self) -> None:
         data = np.array(self._baseline)
         self._mean = data.mean(axis=0)
         self._std = data.std(axis=0)
-        self._model = IsolationForest(contamination=0.05, random_state=42)
-        _call_sklearn(self._model.fit, data, timeout=30.0)
-        baseline_scores = _call_sklearn(self._model.score_samples, data, timeout=10.0)
-        self._score_mean = float(baseline_scores.mean())
-        self._score_std = float(baseline_scores.std()) + 1e-9
+
+        n_features = data.shape[1]
+        cov = np.cov(data, rowvar=False)
+        if cov.ndim == 0:  # 특징 1개인 경우 스칼라 방지
+            cov = cov.reshape(1, 1)
+        # 정칙화: 평균 분산에 비례한 ridge 추가 → 소표본/특이행렬에서도 안정
+        ridge = (np.trace(cov) / n_features) * _COV_RIDGE
+        cov_reg = cov + ridge * np.eye(n_features)
+        self._cov_inv = np.linalg.pinv(cov_reg)  # 의사역행렬 — 특이행렬 안전
+
+        # 베이스라인 거리 분포로 정규화 기준 수립
+        dists = np.array([self._mahalanobis(row) for row in data])
+        self._dist_mean = float(dists.mean())
+        self._dist_std = float(dists.std()) + 1e-9
 
 
 class AnomalyDetector(QObject):
@@ -167,9 +137,6 @@ class AnomalyDetector(QObject):
         for ch in range(len(self._detectors)):
             try:
                 states.append(self._detectors[ch].update(features[ch]))
-            except TimeoutError:
-                # sklearn timeout — 이전 상태 유지하고 계속 진행
-                states.append(self._detectors[ch].state)
             except Exception as exc:
                 logger.error("CH%d 이상감지 업데이트 오류 (건너뜀): %s", ch, exc)
                 states.append(self._detectors[ch].state)
