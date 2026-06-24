@@ -51,6 +51,7 @@ class MainWindow(QMainWindow):
         self._last_mags: Optional[List] = None
         self._enabled_indices: List[int] = list(range(N_CHANNELS_4464))  # 초기: 4464 4채널
         self._active_sample_rate: Optional[float] = None  # 현재 가동 중인 샘플레이트(위젯 편집과 분리)
+        self._plot_warned: set = set()  # 플롯 갱신 실패 1회 경고 추적
 
         # 자동 재시작(워치독): DAQ 오류 시 초기 실행조건 그대로 재연결+재시작
         self._start_config: Optional[dict] = None   # 초기 실행조건 스냅샷
@@ -377,8 +378,13 @@ class MainWindow(QMainWindow):
         # 활성 채널만 필터링
         filtered = data[self._enabled_indices, :]
         self._last_data = filtered
-        self._waveform_plot.update(filtered, self._enabled_indices)
 
+        # ① 핵심 경로 우선: 수집기에 먼저 공급한다. 플롯 그리기(pyqtgraph)가
+        #    Python 3.14+SIP 비호환으로 실패해도 저장·이상감지 데이터 흐름이
+        #    끊기지 않도록 보장한다. (플롯이 먼저면 실패 시 collector 미공급 → 저장 중단)
+        self._collector.on_data_ready(filtered)
+
+        # ② FFT 계산(numpy, 안전) — CSV 저장 버튼용 캐시 갱신
         sample_rate = self._active_sample_rate or float(self._sample_rate_edit.text())
         freqs_list, mags_list = [], []
         for ch_data in filtered:
@@ -387,14 +393,29 @@ class MainWindow(QMainWindow):
             mags_list.append(mags)
         self._last_freqs = freqs_list
         self._last_mags = mags_list
-        self._fft_plot.update(freqs_list, mags_list, self._enabled_indices)
 
-        self._collector.on_data_ready(filtered)
+        # ③ 플롯 갱신 — 표시 전용. 실패해도 슬롯 밖으로 전파되지 않게 보호.
+        self._safe_plot(lambda: self._waveform_plot.update(filtered, self._enabled_indices), "waveform")
+        self._safe_plot(lambda: self._fft_plot.update(freqs_list, mags_list, self._enabled_indices), "fft")
 
     def _on_state_changed(self, states):
-        self._status_light.update_states(states, self._enabled_indices)
+        self._safe_plot(lambda: self._status_light.update_states(states, self._enabled_indices), "status")
         if self._detector:
-            self._anomaly_plot.update(self._detector.if_scores(), self._enabled_indices)
+            self._safe_plot(
+                lambda: self._anomaly_plot.update(self._detector.if_scores(), self._enabled_indices),
+                "anomaly",
+            )
+
+    def _safe_plot(self, fn, name: str) -> None:
+        """플롯 갱신을 보호 실행. pyqtgraph TypeError(Python 3.14+SIP)가
+        Qt 슬롯 밖으로 전파돼 앱이 죽는 것을 막는다. 동일 경고는 1회만 기록."""
+        try:
+            fn()
+        except Exception as exc:
+            if name not in self._plot_warned:
+                self._plot_warned.add(name)
+                logger.warning("플롯 '%s' 갱신 실패 (이후 동일 경고 생략, 데이터 수집은 계속): %s",
+                               name, exc)
 
     def _on_error(self, msg: str):
         logger.error("DAQ 수집 오류 발생: %s", msg)
