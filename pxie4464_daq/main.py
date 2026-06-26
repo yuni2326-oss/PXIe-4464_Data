@@ -112,17 +112,22 @@ def main():
     _setup_logging()
     _install_exception_hook()
     _log = logging.getLogger(__name__)
+    autostart = "--autostart" in sys.argv
     _log.info("=" * 60)
-    _log.info("DAQ 프로그램 시작")
+    _log.info("DAQ 프로그램 시작 (autostart=%s)", autostart)
     _log.info("=" * 60)
     try:
+        from PyQt5.QtCore import QTimer
         _patch_pyqtgraph_hover()
         app = QApplication(sys.argv)
         window = MainWindow()
         window.resize(1400, 800)
         window.show()
+        if autostart:
+            # 이벤트 루프 시작 후 저장된 초기 실행조건으로 자동 재개
+            QTimer.singleShot(1000, window.autostart)
         ret = app.exec_()
-        _log.info("DAQ 프로그램 정상 종료 (exit code=%d)", ret)
+        _log.info("DAQ 프로그램 종료 (exit code=%d)", ret)
         sys.exit(ret)
     except Exception:
         _log.critical("DAQ 프로그램 비정상 종료:\n%s", traceback.format_exc())

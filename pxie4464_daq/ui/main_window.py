@@ -1,13 +1,16 @@
 from __future__ import annotations
+import json
 import logging
+import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, List
 
 import numpy as np
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QCheckBox,
-    QComboBox, QMessageBox, QGridLayout, QScrollArea
+    QComboBox, QMessageBox, QGridLayout, QScrollArea, QApplication
 )
 from PyQt5.QtCore import Qt, QTimer
 
@@ -36,6 +39,18 @@ RESTART_BASE_SEC = 5       # 첫 재시도 지연
 RESTART_MAX_SEC = 300      # 지연 상한 (5분)
 STABLE_RESET_SEC = 120     # 이 시간 무오류 운전 시 재시도 카운터 초기화
 
+# 프로세스 내 복구가 이 횟수만큼 연속 실패하면(= Python 3.14+SIP 상태 손상으로
+# 같은 프로세스에서 회복 불가) 종료 코드 EXIT_NEEDS_RESTART로 빠져나가
+# 외부 supervisor가 새 프로세스로 재시작하게 한다.
+MAX_INPROC_RESTART_FAILS = 3
+EXIT_NEEDS_RESTART = 42
+
+# 패키지 루트(pxie4464-daq) 기준 절대경로 — 작업 디렉터리와 무관하게 daq.log와 동일 위치
+_BASE_DIR = Path(__file__).resolve().parents[2]
+CONFIG_PATH = _BASE_DIR / "config" / "last_session.json"
+HEARTBEAT_PATH = _BASE_DIR / "logs" / "heartbeat.txt"
+HEARTBEAT_FILE_SEC = 20    # supervisor 감시용 heartbeat 파일 기록 주기
+
 
 class MainWindow(QMainWindow):
     def __init__(self, parent=None):
@@ -57,6 +72,7 @@ class MainWindow(QMainWindow):
         self._start_config: Optional[dict] = None   # 초기 실행조건 스냅샷
         self._auto_restart_enabled: bool = True
         self._restart_attempts: int = 0
+        self._consecutive_restart_failures: int = 0  # 프로세스 내 복구 연속 실패 횟수
         self._setup_ui()
         self._restart_timer = QTimer(self)
         self._restart_timer.setSingleShot(True)
@@ -65,6 +81,7 @@ class MainWindow(QMainWindow):
         self._stable_timer.setSingleShot(True)
         self._stable_timer.timeout.connect(self._on_stable)
         self._start_heartbeat()
+        self._start_heartbeat_file()
 
     # ── UI 구성 ─────────────────────────────────────────────────────────────
 
@@ -227,6 +244,22 @@ class MainWindow(QMainWindow):
         self._heartbeat_timer.timeout.connect(self._on_heartbeat)
         self._heartbeat_timer.start()
 
+    def _start_heartbeat_file(self) -> None:
+        """supervisor 감시용 heartbeat 파일을 주기적으로 갱신한다.
+        메인 스레드(GUI 이벤트 루프)가 살아있다는 증거 — 멈추면 supervisor가 재시작."""
+        self._hb_file_timer = QTimer(self)
+        self._hb_file_timer.setInterval(HEARTBEAT_FILE_SEC * 1000)
+        self._hb_file_timer.timeout.connect(self._write_heartbeat_file)
+        self._hb_file_timer.start()
+        self._write_heartbeat_file()
+
+    def _write_heartbeat_file(self) -> None:
+        try:
+            HEARTBEAT_PATH.parent.mkdir(exist_ok=True)
+            HEARTBEAT_PATH.write_text(str(time.time()), encoding="utf-8")
+        except Exception:
+            pass
+
     def _on_heartbeat(self) -> None:
         try:
             worker_state = "running" if (self._worker and self._worker.isRunning()) else "stopped"
@@ -338,10 +371,71 @@ class MainWindow(QMainWindow):
             return
         self._start_config = cfg          # 초기 실행조건 스냅샷 저장
         self._restart_attempts = 0
+        self._consecutive_restart_failures = 0
+        self._save_session_config(cfg)    # 새 프로세스 자동시작용 파일 저장
         self._start_btn.setEnabled(True)
         self._connect_btn.setEnabled(False)
         logger.info("연결 완료 (자동 재시작 %s)",
                     "ON" if self._auto_restart_enabled else "OFF")
+
+    # ── 세션 설정 영속화 / 자동 시작 ─────────────────────────────────────────
+
+    def _save_session_config(self, cfg: dict) -> None:
+        """초기 실행조건을 파일로 저장 (supervisor 재시작 시 자동 재개용)."""
+        try:
+            CONFIG_PATH.parent.mkdir(exist_ok=True)
+            CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+        except Exception as exc:
+            logger.warning("세션 설정 저장 실패: %s", exc)
+
+    def _load_session_config(self) -> Optional[dict]:
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _apply_config_to_widgets(self, cfg: dict) -> None:
+        """저장된 설정을 UI 위젯에 반영 (표시 일관성)."""
+        def _fmt(v):
+            return str(int(v)) if float(v).is_integer() else str(v)
+        self._dev4464_edit.setText(cfg.get("dev4464", "PXI1Slot3"))
+        self._dev4492_edit.setText(cfg.get("dev4492", "PXI1Slot5"))
+        self._use_4492_check.setChecked(bool(cfg.get("use_4492", False)))
+        self._sample_rate_edit.setText(_fmt(cfg["sample_rate"]))
+        self._chunk_edit.setText(str(int(cfg["chunk"])))
+        idx = self._voltage_combo.findData(cfg.get("voltage_range"))
+        if idx >= 0:
+            self._voltage_combo.setCurrentIndex(idx)
+        self._cycle_sec_edit.setText(_fmt(cfg["cycle_sec"]))
+        self._window_sec_edit.setText(_fmt(cfg["window_sec"]))
+        self._baseline_count_edit.setText(str(int(cfg["baseline_count"])))
+        self._save_interval_edit.setText(_fmt(cfg["save_interval_sec"] / 60.0))
+        self._mock_check.setChecked(bool(cfg.get("mock", True)))
+        enabled = set(cfg.get("enabled_indices", []))
+        for i, cb in enumerate(self._ch_checks):
+            cb.setChecked(i in enabled)
+
+    def autostart(self) -> None:
+        """--autostart: 저장된 초기 실행조건으로 자동 연결+시작.
+        supervisor가 새 프로세스를 띄울 때 무인 자동 재개를 가능케 한다."""
+        cfg = self._load_session_config()
+        if not cfg:
+            logger.info("[autostart] 저장된 세션 설정 없음 — 수동 설정 대기")
+            return
+        logger.info("[autostart] 저장된 초기 실행조건으로 자동 시작")
+        try:
+            self._apply_config_to_widgets(cfg)
+            self._build_pipeline(cfg)
+        except Exception as exc:
+            logger.error("[autostart] 파이프라인 구성 실패: %s", exc)
+            return
+        self._start_config = cfg
+        self._restart_attempts = 0
+        self._consecutive_restart_failures = 0
+        self._start_btn.setEnabled(True)
+        self._connect_btn.setEnabled(False)
+        self._start_acquisition()
 
     def _on_start_stop(self):
         if self._worker is None or not self._worker.isRunning():
@@ -469,11 +563,27 @@ class MainWindow(QMainWindow):
         try:
             self._build_pipeline(self._start_config)
         except Exception as exc:
-            logger.warning("[자동재시작] 재연결 실패 (#%d): %s — 재예약",
-                           self._restart_attempts, exc)
+            self._consecutive_restart_failures += 1
+            logger.warning("[자동재시작] 재연결 실패 (#%d, 연속 %d/%d): %s",
+                           self._restart_attempts, self._consecutive_restart_failures,
+                           MAX_INPROC_RESTART_FAILS, exc)
+            # 프로세스 내 복구가 반복 실패 = Python 3.14+SIP 상태 손상으로
+            # 같은 프로세스에서 회복 불가. 종료하여 supervisor가 새 프로세스로 재시작.
+            if self._consecutive_restart_failures >= MAX_INPROC_RESTART_FAILS:
+                logger.critical(
+                    "[자동재시작] 프로세스 내 복구 %d회 연속 실패 — "
+                    "새 프로세스 재시작 필요. 종료(code=%d). "
+                    "(supervisor 미사용 시 수동 재시작 요망)",
+                    MAX_INPROC_RESTART_FAILS, EXIT_NEEDS_RESTART,
+                )
+                app = QApplication.instance()
+                if app is not None:
+                    app.exit(EXIT_NEEDS_RESTART)
+                return
             self._schedule_restart()
             return
         self._start_acquisition()
+        self._consecutive_restart_failures = 0
         logger.info("[자동재시작] 성공 (#%d). %d초 무오류 시 카운터 초기화",
                     self._restart_attempts, STABLE_RESET_SEC)
         self._stable_timer.start(STABLE_RESET_SEC * 1000)
@@ -483,6 +593,7 @@ class MainWindow(QMainWindow):
             logger.info("[자동재시작] %d초 안정 운전 확인 — 재시도 카운터 초기화",
                         STABLE_RESET_SEC)
         self._restart_attempts = 0
+        self._consecutive_restart_failures = 0
 
     def _on_save_csv(self):
         if self._last_data is None:

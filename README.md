@@ -72,10 +72,12 @@ pxie4464_daq/
 │   ├── fft_plot.py            # 실시간 FFT (0–5 kHz)
 │   ├── anomaly_plot.py        # 이상 점수 히스토리
 │   └── status_light.py        # 채널별 상태 표시등
-└── main.py                    # 진입점 (로깅·예외훅·pyqtgraph 패치)
+└── main.py                    # 진입점 (로깅·예외훅·pyqtgraph 패치·--autostart)
+supervisor.py                  # 외부 감시: 비정상 종료/hang 시 새 프로세스 재시작
+run_supervised.bat             # supervisor 실행 런처
 tests/                         # pytest 단위 테스트 (27 passed)
 tools/disable_sleep.ps1        # 화면보호기·절전 비활성화 스크립트
-logs/  results/                # 런타임 산출물 (gitignore)
+logs/  results/  config/       # 런타임 산출물 (gitignore)
 ```
 
 ## 설치 및 실행
@@ -94,10 +96,27 @@ python -m pxie4464_daq.main      # 또는 python pxie4464_daq/main.py
 3. **오류 시 자동 재시작** 체크(기본 ON) — 무인 운전 권장
 4. **연결** → **▶ 시작**
 
-### 무인 장시간 운전 팁
+### 무인 장시간 운전 (권장: supervisor 사용)
 
+```bat
+run_supervised.bat          REM = python supervisor.py
+```
+
+2단계 복구 구조로 수일 연속 무인 운전을 보장한다:
+
+1. **프로세스 내 자동 재시작** — DAQ 오류 시 초기 실행조건 그대로 재연결(지수 백오프)
+2. **외부 supervisor** — 프로세스 내 복구가 3회 연속 실패(= Python 3.14+SIP 상태 손상)하거나
+   앱이 비정상 종료/응답없음(heartbeat 정체)이면, **새 프로세스로 재시작**한다.
+   `연결` 성공 시 저장된 `config/last_session.json`을 `--autostart`로 자동 재개하므로
+   사람 개입 없이 같은 조건으로 수집이 이어진다.
+
+> **왜 외부 supervisor가 필요한가**: "argument 5" DAQ 끊김이 pyqtgraph 페인트 도중 발생하면
+> Python 3.14 + PyQt5 SIP 상태가 손상되어, 같은 프로세스에서 플롯 객체를 다시 만들 수 없다
+> (`cannot create weak reference to 'NoneType'`). 손상된 SIP 상태는 **새 프로세스만** 회복할 수 있다.
+
+추가로:
 - `tools/disable_sleep.ps1`을 관리자 권한으로 실행해 화면보호기·절전·USB 선택적 절전·PCIe 링크 전원관리를 끈다. (절전 진입 시 PXI 버스가 끊기며 "argument 5" 오류 유발)
-- 로그는 `logs/daq.log`(10 MB × 5 회전)에 기록되며, 저장 성공/실패·디스크 여유·heartbeat·자동 재시작 이력을 확인할 수 있다.
+- 로그: `logs/daq.log`(앱), `logs/supervisor.log`(감시), `logs/heartbeat.txt`(생존 신호). 저장 성공/실패·디스크 여유·재시작 이력 확인 가능.
 
 ## 안정성 개선 이력 (장시간 운전)
 
