@@ -13,6 +13,7 @@ try:
         AcquisitionType,
         ExcitationSource,
         AccelSensitivityUnits,
+        AccelUnits,
         Edge,
     )
     from nidaqmx.stream_readers import AnalogMultiChannelReader
@@ -23,6 +24,14 @@ except ImportError:
 
 N_CHANNELS_4464 = 4
 N_CHANNELS_4492 = 8
+
+G_TO_MS2 = 9.80665            # 1 g = 9.80665 m/s²
+DEFAULT_SENSITIVITY = 10.2   # mV/(m/s²) — PCB 352C33 기본값
+
+# 두 장비의 출력을 동일한 물리 단위(m/s²)로 통일한다:
+#  - PXIe-4464: 가속도 채널이 감도로 나눠 m/s²를 반환
+#  - PXIe-4492: raw 전압을 동일 감도로 나눠 m/s²로 변환
+# 감도 s[mV/(m/s²)]에 대해  가속도[m/s²] = 전압[V] × 1000 / s
 
 
 class _DAQBase(ABC):
@@ -38,7 +47,8 @@ class _DAQBase(ABC):
             logger.warning("stop() during context exit raised: %s", exc)
 
     @abstractmethod
-    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0) -> None: ...
+    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0,
+                  sensitivity: float = DEFAULT_SENSITIVITY) -> None: ...
 
     @abstractmethod
     def read(self) -> np.ndarray: ...
@@ -60,7 +70,8 @@ class MockDAQ(_DAQBase):
         self._rng = np.random.default_rng()
         self._running = False
 
-    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0) -> None:
+    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0,
+                  sensitivity: float = DEFAULT_SENSITIVITY) -> None:
         if sample_rate <= 0:
             raise ValueError(f"sample_rate must be positive, got {sample_rate}")
         if record_length <= 0:
@@ -90,12 +101,13 @@ class MockDAQ(_DAQBase):
 class PXIe4464(_DAQBase):
     """NI PXIe-4464 4채널 IEPE 가속도계 드라이버."""
 
-    def __init__(self, device_name: str = "PXI1Slot3", sensitivity: float = 100.0,
+    def __init__(self, device_name: str = "PXI1Slot3",
+                 sensitivity: float = DEFAULT_SENSITIVITY,
                  excit_current: float = 0.004):
         if not _NIDAQMX_AVAILABLE:
             raise RuntimeError("nidaqmx is not installed")
         self._device_name = device_name
-        self._sensitivity = sensitivity       # mV/g
+        self._sensitivity = sensitivity       # mV/(m/s²)
         self._excit_current = excit_current   # A (0.002 or 0.004)
         self._sample_rate: float = 51200.0
         self._record_length: int = 1024
@@ -104,22 +116,31 @@ class PXIe4464(_DAQBase):
         self._reader: Optional[AnalogMultiChannelReader] = None
         self._buffer: Optional[np.ndarray] = None
 
-    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0) -> None:
+    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0,
+                  sensitivity: float = DEFAULT_SENSITIVITY) -> None:
         self._sample_rate = float(sample_rate)
         self._record_length = int(record_length)
         self._voltage_range = float(voltage_range)
+        self._sensitivity = float(sensitivity)
 
     def start(self) -> None:
         self._task = nidaqmx.Task()
         ch = f"{self._device_name}/ai0:{N_CHANNELS_4464 - 1}"
+        # 감도 mV/(m/s²) → DAQmx가 요구하는 mV/g 로 변환. 출력 단위는 m/s².
+        sens_mv_per_g = self._sensitivity * G_TO_MS2
+        # 입력 전압 레인지(±voltage_range V)에 해당하는 m/s² 범위로 min/max 설정
+        # (레인지도 m/s² 단위로 해석되므로 전압 레인지를 그대로 넘기면 안 됨)
+        sens_v_per_ms2 = self._sensitivity / 1000.0
+        max_eng = self._voltage_range / sens_v_per_ms2 if sens_v_per_ms2 > 0 else self._voltage_range
         self._task.ai_channels.add_ai_accel_chan(
             physical_channel=ch,
-            sensitivity=self._sensitivity,
+            sensitivity=sens_mv_per_g,
             sensitivity_units=AccelSensitivityUnits.MILLIVOLTS_PER_G,
+            units=AccelUnits.METERS_PER_SECOND_SQUARED,
             current_excit_source=ExcitationSource.INTERNAL,
             current_excit_val=self._excit_current,
-            min_val=-self._voltage_range,
-            max_val=self._voltage_range,
+            min_val=-max_eng,
+            max_val=max_eng,
         )
         self._task.timing.cfg_samp_clk_timing(
             rate=self._sample_rate,
@@ -166,21 +187,32 @@ class PXIe4464(_DAQBase):
 class PXIe4492(_DAQBase):
     """NI PXIe-4492 8채널 전압 입력 드라이버."""
 
-    def __init__(self, device_name: str = "PXI1Slot5", voltage_range: float = 10.0):
+    def __init__(self, device_name: str = "PXI1Slot5", voltage_range: float = 10.0,
+                 sensitivity: float = DEFAULT_SENSITIVITY, convert_to_accel: bool = True):
         if not _NIDAQMX_AVAILABLE:
             raise RuntimeError("nidaqmx is not installed")
         self._device_name = device_name
         self._sample_rate: float = 51200.0
         self._record_length: int = 1024
         self._voltage_range: float = voltage_range
+        self._sensitivity = sensitivity       # mV/(m/s²)
+        self._convert = convert_to_accel      # True면 전압→m/s² 변환 (4464와 단위 통일)
         self._task: Optional[nidaqmx.Task] = None
         self._reader: Optional[AnalogMultiChannelReader] = None
         self._buffer: Optional[np.ndarray] = None
 
-    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0) -> None:
+    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0,
+                  sensitivity: float = DEFAULT_SENSITIVITY) -> None:
         self._sample_rate = float(sample_rate)
         self._record_length = int(record_length)
         self._voltage_range = float(voltage_range)
+        self._sensitivity = float(sensitivity)
+
+    def _to_accel(self, buffer: np.ndarray) -> np.ndarray:
+        """raw 전압[V] → 가속도[m/s²]. 4464와 동일 단위로 맞춘다."""
+        if self._convert and self._sensitivity > 0:
+            return buffer * (1000.0 / self._sensitivity)  # V × 1000 / (mV/(m/s²))
+        return buffer
 
     def start(self) -> None:
         self._task = nidaqmx.Task()
@@ -228,7 +260,7 @@ class PXIe4492(_DAQBase):
             )
             if samps_read is None or samps_read < self._record_length:
                 raise RuntimeError(f"Partial read after retry: {samps_read}/{self._record_length}")
-        return self._buffer.copy()
+        return self._to_accel(self._buffer.copy())
 
 
 class MultiDAQ(_DAQBase):
@@ -237,9 +269,10 @@ class MultiDAQ(_DAQBase):
     def __init__(self, *daqs: _DAQBase):
         self._daqs: List[_DAQBase] = list(daqs)
 
-    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0) -> None:
+    def configure(self, sample_rate: float, record_length: int, voltage_range: float = 10.0,
+                  sensitivity: float = DEFAULT_SENSITIVITY) -> None:
         for daq in self._daqs:
-            daq.configure(sample_rate, record_length, voltage_range)
+            daq.configure(sample_rate, record_length, voltage_range, sensitivity)
 
     def start(self) -> None:
         for daq in self._daqs:

@@ -16,7 +16,7 @@ from PyQt5.QtCore import Qt, QTimer
 
 from pxie4464_daq.device.daq import (
     MockDAQ, PXIe4464, PXIe4492, MultiDAQ, _DAQBase,
-    N_CHANNELS_4464, N_CHANNELS_4492,
+    N_CHANNELS_4464, N_CHANNELS_4492, DEFAULT_SENSITIVITY,
 )
 from pxie4464_daq.acquisition.worker import AcquisitionWorker
 from pxie4464_daq.analysis.fft import compute_fft
@@ -164,6 +164,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._voltage_combo, row, 1)
         row += 1
 
+        # 센서 감도 (mV/(m/s²)) — 4464 가속도 변환 + 4492 전압→가속도 변환에 공통 적용.
+        # PCB 352C33 = 10.2 mV/(m/s²) (≈100 mV/g)
+        layout.addWidget(QLabel("센서 감도 (mV/(m/s²))"), row, 0)
+        self._sensitivity_edit = QLineEdit("10.2")
+        layout.addWidget(self._sensitivity_edit, row, 1)
+        row += 1
+
         layout.addWidget(QLabel("수집 주기 (s)"), row, 0)
         self._cycle_sec_edit = QLineEdit("30")
         layout.addWidget(self._cycle_sec_edit, row, 1)
@@ -299,6 +306,7 @@ class MainWindow(QMainWindow):
             "window_sec": float(self._window_sec_edit.text()),
             "baseline_count": int(self._baseline_count_edit.text()),
             "save_interval_sec": float(self._save_interval_edit.text()) * 60.0,
+            "sensitivity": float(self._sensitivity_edit.text()),
             "use_4492": use_4492,
             "mock": self._mock_check.isChecked(),
             "dev4464": self._dev4464_edit.text(),
@@ -327,16 +335,19 @@ class MainWindow(QMainWindow):
             else:
                 self._daq = daq_4464
         else:
-            daq_4464 = PXIe4464(device_name=cfg["dev4464"])
+            sensitivity = cfg.get("sensitivity", DEFAULT_SENSITIVITY)
+            daq_4464 = PXIe4464(device_name=cfg["dev4464"], sensitivity=sensitivity)
             if cfg["use_4492"]:
                 daq_4492 = PXIe4492(device_name=cfg["dev4492"],
-                                    voltage_range=cfg["voltage_range"])
+                                    voltage_range=cfg["voltage_range"],
+                                    sensitivity=sensitivity)
                 self._daq = MultiDAQ(daq_4464, daq_4492)
             else:
                 self._daq = daq_4464
 
         self._daq.configure(sample_rate=sample_rate, record_length=cfg["chunk"],
-                            voltage_range=cfg["voltage_range"])
+                            voltage_range=cfg["voltage_range"],
+                            sensitivity=cfg.get("sensitivity", DEFAULT_SENSITIVITY))
 
         # 플롯 재구성
         self._waveform_plot._sample_rate = sample_rate
@@ -411,6 +422,7 @@ class MainWindow(QMainWindow):
         self._window_sec_edit.setText(_fmt(cfg["window_sec"]))
         self._baseline_count_edit.setText(str(int(cfg["baseline_count"])))
         self._save_interval_edit.setText(_fmt(cfg["save_interval_sec"] / 60.0))
+        self._sensitivity_edit.setText(_fmt(cfg.get("sensitivity", DEFAULT_SENSITIVITY)))
         self._mock_check.setChecked(bool(cfg.get("mock", True)))
         enabled = set(cfg.get("enabled_indices", []))
         for i, cb in enumerate(self._ch_checks):
