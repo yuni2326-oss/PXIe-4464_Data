@@ -191,6 +191,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._save_interval_edit, row, 1)
         row += 1
 
+        # 저장 하위폴더 — 비우면 results/ 루트, 입력 시 results/<이름>/ 에 저장
+        layout.addWidget(QLabel("저장 하위폴더"), row, 0)
+        self._subdir_edit = QLineEdit("")
+        self._subdir_edit.setPlaceholderText("비우면 results/ 루트")
+        layout.addWidget(self._subdir_edit, row, 1)
+        row += 1
+
         self._mock_check = QCheckBox("Mock 모드")
         self._mock_check.setChecked(True)
         layout.addWidget(self._mock_check, row, 0, 1, 2)
@@ -307,6 +314,7 @@ class MainWindow(QMainWindow):
             "baseline_count": int(self._baseline_count_edit.text()),
             "save_interval_sec": float(self._save_interval_edit.text()) * 60.0,
             "sensitivity": float(self._sensitivity_edit.text()),
+            "save_subdir": self._subdir_edit.text().strip(),
             "use_4492": use_4492,
             "mock": self._mock_check.isChecked(),
             "dev4464": self._dev4464_edit.text(),
@@ -367,8 +375,11 @@ class MainWindow(QMainWindow):
         self._detector.state_changed.connect(self._on_state_changed)
         self._collector.features_ready.connect(self._detector.update)
 
-        self._data_saver = DataSaver(sample_rate=sample_rate, save_dir="results",
+        subdir = (cfg.get("save_subdir") or "").strip()
+        save_dir = str(Path("results") / subdir) if subdir else "results"
+        self._data_saver = DataSaver(sample_rate=sample_rate, save_dir=save_dir,
                                      save_interval_sec=cfg["save_interval_sec"])
+        logger.info("저장 폴더: %s", save_dir)
         self._collector.raw_ready.connect(self._data_saver.on_raw)
         logger.info("파이프라인 구성: %s, 활성 채널=%s, sr=%.0f",
                     type(self._daq).__name__, self._enabled_indices, sample_rate)
@@ -423,6 +434,7 @@ class MainWindow(QMainWindow):
         self._baseline_count_edit.setText(str(int(cfg["baseline_count"])))
         self._save_interval_edit.setText(_fmt(cfg["save_interval_sec"] / 60.0))
         self._sensitivity_edit.setText(_fmt(cfg.get("sensitivity", DEFAULT_SENSITIVITY)))
+        self._subdir_edit.setText(cfg.get("save_subdir", ""))
         self._mock_check.setChecked(bool(cfg.get("mock", True)))
         enabled = set(cfg.get("enabled_indices", []))
         for i, cb in enumerate(self._ch_checks):
