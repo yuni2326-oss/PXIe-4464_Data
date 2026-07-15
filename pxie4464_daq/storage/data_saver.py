@@ -15,22 +15,14 @@ from pxie4464_daq.analysis.fft import compute_fft
 
 _log = logging.getLogger(__name__)
 
-_DISK_WARN_GB = 5.0        # 여유 공간이 이 값 미만이면 경고
-FFT_SAVE_MAX_HZ = 5000.0   # FFT 저장 상한 주파수 (표시와 동일, 쓰기시간 단축)
+_DISK_WARN_GB = 5.0  # 여유 공간이 이 값 미만이면 경고
 
 
 class DataSaver(QObject):
-    """주기적으로 n채널 raw 파형(.npz)과 FFT 스펙트럼(0–5kHz CSV)을 자동 저장.
+    """주기적으로 n채널 raw 파형과 FFT 스펙트럼을 CSV로 자동 저장.
 
     FeatureCollector.raw_ready 시그널에 연결하여 사용.
-    save_interval_sec 마다 한 번만 실제 파일을 기록한다 (0이면 매 사이클 저장).
-
-    raw는 float32 압축 없는 .npz(data, sample_rate, unit)로 저장 — CSV 대비
-    쓰기 ~180배 빠르고 파일 ~1/6. 코스트다운 등 연속 저장에 적합.
-    FFT는 0–5kHz만 CSV로 저장하여 쓰기시간을 추가로 단축.
-
-    .npz 읽기 예:
-        d = numpy.load("..._raw.npz"); arr = d["data"]; sr = float(d["sample_rate"])
+    save_interval_sec 마다 한 번만 실제 파일을 기록한다 (기본 30분).
 
     Slots:
         on_raw(datetime, np.ndarray): (timestamp, shape (n, N)) 수신 시 주기 판단 후 저장
@@ -73,7 +65,7 @@ class DataSaver(QObject):
             elapsed_w = time.monotonic() - t_start
 
             # 저장된 파일 크기 합산
-            fnames = [f"{stem}_raw.npz"] + [f"{stem}_fft_ch{ch}.csv" for ch in range(n_ch)]
+            fnames = [f"{stem}_raw.csv"] + [f"{stem}_fft_ch{ch}.csv" for ch in range(n_ch)]
             size_kb = sum(
                 (self._save_dir / f).stat().st_size
                 for f in fnames
@@ -94,25 +86,21 @@ class DataSaver(QObject):
             )
 
     def _write_raw(self, stem: str, data: np.ndarray) -> None:
-        """n채널 원시 데이터를 .npz(float32)로 저장 — 시간축은 sample_rate로 복원.
-
-        time_s[i] = i / sample_rate.  단위는 m/s².
-        """
-        path = self._save_dir / f"{stem}_raw.npz"
-        np.savez(
-            path,
-            data=data.astype(np.float32),
-            sample_rate=np.float64(self._sample_rate),
-            unit="m/s^2",
-            timestamp=stem,
-        )
+        """n채널 원시 데이터를 하나의 CSV에 저장 (컬럼: time_s, ch0..chN-1)."""
+        n_ch = data.shape[0]
+        path = self._save_dir / f"{stem}_raw.csv"
+        n = data.shape[1]
+        time_arr = np.arange(n) / self._sample_rate
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["time_s"] + [f"ch{ch}" for ch in range(n_ch)])
+            for i, t in enumerate(time_arr):
+                writer.writerow([f"{t:.8f}"] + [f"{data[ch, i]:.8f}" for ch in range(n_ch)])
 
     def _write_fft(self, stem: str, data: np.ndarray) -> None:
-        """n채널 FFT 스펙트럼(0–5kHz)을 채널별 CSV로 저장."""
+        """n채널 FFT 스펙트럼을 채널별 CSV로 저장."""
         for ch in range(data.shape[0]):
             freqs, mags = compute_fft(data[ch], self._sample_rate)
-            mask = freqs <= FFT_SAVE_MAX_HZ
-            freqs, mags = freqs[mask], mags[mask]
             path = self._save_dir / f"{stem}_fft_ch{ch}.csv"
             with path.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
