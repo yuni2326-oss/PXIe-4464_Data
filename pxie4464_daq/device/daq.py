@@ -188,15 +188,19 @@ class PXIe4492(_DAQBase):
     """NI PXIe-4492 8채널 전압 입력 드라이버."""
 
     def __init__(self, device_name: str = "PXI1Slot5", voltage_range: float = 10.0,
-                 sensitivity: float = DEFAULT_SENSITIVITY, convert_to_accel: bool = True):
+                 sensitivity: float = DEFAULT_SENSITIVITY, convert_to_accel: bool = True,
+                 mic_channels=None, mic_sensitivity: float = 50.0):
         if not _NIDAQMX_AVAILABLE:
             raise RuntimeError("nidaqmx is not installed")
         self._device_name = device_name
         self._sample_rate: float = 51200.0
         self._record_length: int = 1024
         self._voltage_range: float = voltage_range
-        self._sensitivity = sensitivity       # mV/(m/s²)
-        self._convert = convert_to_accel      # True면 전압→m/s² 변환 (4464와 단위 통일)
+        self._sensitivity = sensitivity       # 가속도계 감도 mV/(m/s²)
+        self._convert = convert_to_accel      # True면 전압→물리단위 변환
+        # 마이크로폰 채널: 4492 로컬 ai 인덱스 집합(0~7). 해당 채널은 전압→음압(Pa) 변환.
+        self._mic_locals = set(int(c) for c in (mic_channels or []))
+        self._mic_sensitivity = float(mic_sensitivity)  # mV/Pa
         self._task: Optional[nidaqmx.Task] = None
         self._reader: Optional[AnalogMultiChannelReader] = None
         self._buffer: Optional[np.ndarray] = None
@@ -209,10 +213,20 @@ class PXIe4492(_DAQBase):
         self._sensitivity = float(sensitivity)
 
     def _to_accel(self, buffer: np.ndarray) -> np.ndarray:
-        """raw 전압[V] → 가속도[m/s²]. 4464와 동일 단위로 맞춘다."""
-        if self._convert and self._sensitivity > 0:
-            return buffer * (1000.0 / self._sensitivity)  # V × 1000 / (mV/(m/s²))
-        return buffer
+        """채널별 물리단위 변환.
+        - 마이크로폰 채널(mic_locals): 전압[V] → 음압[Pa]  (V × 1000 / (mV/Pa))
+        - 그 외(가속도계): 전압[V] → 가속도[m/s²]        (V × 1000 / (mV/(m/s²)))
+        """
+        if not self._convert:
+            return buffer
+        out = buffer.copy()
+        for ch in range(buffer.shape[0]):
+            if ch in self._mic_locals:
+                if self._mic_sensitivity > 0:
+                    out[ch] = buffer[ch] * (1000.0 / self._mic_sensitivity)   # → Pa
+            elif self._sensitivity > 0:
+                out[ch] = buffer[ch] * (1000.0 / self._sensitivity)           # → m/s²
+        return out
 
     def start(self) -> None:
         self._task = nidaqmx.Task()

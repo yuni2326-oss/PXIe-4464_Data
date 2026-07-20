@@ -37,6 +37,17 @@ N_TOTAL_MAX = N_CHANNELS_4464 + N_CHANNELS_4492  # 12
 # NAS 전송 기본 경로 (네트워크 드라이브 UNC)
 DEFAULT_NAS_DIR = r"\\10.130.121.158\ai_gpu_001\GY_DATA\pump data"
 
+
+def _parse_int_list(text: str) -> list:
+    """쉼표/공백 구분 정수 목록 파싱. 잘못된 항목은 무시."""
+    out = []
+    for tok in (text or "").replace(",", " ").split():
+        try:
+            out.append(int(tok))
+        except ValueError:
+            pass
+    return out
+
 # 자동 재시작 백오프 파라미터
 RESTART_BASE_SEC = 5       # 첫 재시도 지연
 RESTART_MAX_SEC = 300      # 지연 상한 (5분)
@@ -167,11 +178,29 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._voltage_combo, row, 1)
         row += 1
 
-        # 센서 감도 (mV/(m/s²)) — 4464 가속도 변환 + 4492 전압→가속도 변환에 공통 적용.
+        # 센서 감도 (mV/(m/s²)) — 4464 가속도 변환 + 4492 가속도계 채널 변환에 적용.
         # PCB 352C33 = 10.2 mV/(m/s²) (≈100 mV/g)
-        layout.addWidget(QLabel("센서 감도 (mV/(m/s²))"), row, 0)
+        layout.addWidget(QLabel("가속도계 감도 (mV/(m/s²))"), row, 0)
         self._sensitivity_edit = QLineEdit("10.2")
         layout.addWidget(self._sensitivity_edit, row, 1)
+        row += 1
+
+        # 마이크로폰 채널 — 4492에서 마이크가 연결된 CH 번호(쉼표구분). 해당 채널은 Pa로 변환.
+        # 예: Crysound 333T1(IEPE, 50 mV/Pa)을 CH6에 연결 → "6"
+        layout.addWidget(QLabel("마이크 채널 (CH)"), row, 0)
+        self._mic_ch_edit = QLineEdit("")
+        self._mic_ch_edit.setPlaceholderText("예: 6 (비우면 없음)")
+        layout.addWidget(self._mic_ch_edit, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("마이크 감도 (mV/Pa)"), row, 0)
+        self._mic_sens_edit = QLineEdit("50")
+        layout.addWidget(self._mic_sens_edit, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("FFT 표시 상한 (Hz)"), row, 0)
+        self._fft_max_edit = QLineEdit("5000")
+        layout.addWidget(self._fft_max_edit, row, 1)
         row += 1
 
         layout.addWidget(QLabel("수집 주기 (s)"), row, 0)
@@ -329,6 +358,9 @@ class MainWindow(QMainWindow):
             "baseline_count": int(self._baseline_count_edit.text()),
             "save_interval_sec": float(self._save_interval_edit.text()) * 60.0,
             "sensitivity": float(self._sensitivity_edit.text()),
+            "mic_channels": _parse_int_list(self._mic_ch_edit.text()),
+            "mic_sensitivity": float(self._mic_sens_edit.text() or 50.0),
+            "fft_max_hz": float(self._fft_max_edit.text() or 5000.0),
             "save_subdir": self._subdir_edit.text().strip(),
             "nas_dir": self._nas_edit.text().strip(),
             "nas_delete": self._nas_delete_check.isChecked(),
@@ -363,9 +395,14 @@ class MainWindow(QMainWindow):
             sensitivity = cfg.get("sensitivity", DEFAULT_SENSITIVITY)
             daq_4464 = PXIe4464(device_name=cfg["dev4464"], sensitivity=sensitivity)
             if cfg["use_4492"]:
+                # 마이크 채널: 전역 CH번호 → 4492 로컬 ai 인덱스(CH - 4464채널수)
+                mic_locals = [c - N_CHANNELS_4464 for c in cfg.get("mic_channels", [])
+                              if c >= N_CHANNELS_4464]
                 daq_4492 = PXIe4492(device_name=cfg["dev4492"],
                                     voltage_range=cfg["voltage_range"],
-                                    sensitivity=sensitivity)
+                                    sensitivity=sensitivity,
+                                    mic_channels=mic_locals,
+                                    mic_sensitivity=cfg.get("mic_sensitivity", 50.0))
                 self._daq = MultiDAQ(daq_4464, daq_4492)
             else:
                 self._daq = daq_4464
@@ -377,6 +414,7 @@ class MainWindow(QMainWindow):
         # 플롯 재구성
         self._waveform_plot._sample_rate = sample_rate
         self._waveform_plot.reconfigure(self._enabled_indices)
+        self._fft_plot.set_freq_max(cfg.get("fft_max_hz", 5000.0))
         self._fft_plot.reconfigure(self._enabled_indices)
         self._anomaly_plot.reconfigure(self._enabled_indices)
         self._status_light.reconfigure(self._enabled_indices)
@@ -458,6 +496,9 @@ class MainWindow(QMainWindow):
         self._baseline_count_edit.setText(str(int(cfg["baseline_count"])))
         self._save_interval_edit.setText(_fmt(cfg["save_interval_sec"] / 60.0))
         self._sensitivity_edit.setText(_fmt(cfg.get("sensitivity", DEFAULT_SENSITIVITY)))
+        self._mic_ch_edit.setText(" ".join(str(c) for c in cfg.get("mic_channels", [])))
+        self._mic_sens_edit.setText(_fmt(cfg.get("mic_sensitivity", 50.0)))
+        self._fft_max_edit.setText(_fmt(cfg.get("fft_max_hz", 5000.0)))
         self._subdir_edit.setText(cfg.get("save_subdir", ""))
         self._nas_edit.setText(cfg.get("nas_dir", DEFAULT_NAS_DIR))
         self._nas_delete_check.setChecked(bool(cfg.get("nas_delete", False)))
@@ -476,11 +517,15 @@ class MainWindow(QMainWindow):
         logger.info("[autostart] 저장된 초기 실행조건으로 자동 시작")
         try:
             self._apply_config_to_widgets(cfg)
+            # 위젯 반영 후 설정을 다시 읽어 새로 추가된 항목(NAS 경로 등)의 기본값이
+            # 구버전 config에도 자동 반영되게 한다(스키마 진화 자가 치유).
+            cfg = self._read_config()
             self._build_pipeline(cfg)
         except Exception as exc:
             logger.error("[autostart] 파이프라인 구성 실패: %s", exc)
             return
         self._start_config = cfg
+        self._save_session_config(cfg)  # 갱신된 설정 저장(다음 재시작부터 정상)
         self._restart_attempts = 0
         self._consecutive_restart_failures = 0
         self._start_btn.setEnabled(True)
