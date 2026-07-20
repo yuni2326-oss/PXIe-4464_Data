@@ -14,6 +14,7 @@ try:
         ExcitationSource,
         AccelSensitivityUnits,
         AccelUnits,
+        SoundPressureUnits,
         Edge,
     )
     from nidaqmx.stream_readers import AnalogMultiChannelReader
@@ -189,7 +190,8 @@ class PXIe4492(_DAQBase):
 
     def __init__(self, device_name: str = "PXI1Slot5", voltage_range: float = 10.0,
                  sensitivity: float = DEFAULT_SENSITIVITY, convert_to_accel: bool = True,
-                 mic_channels=None, mic_sensitivity: float = 50.0):
+                 mic_channels=None, mic_sensitivity: float = 50.0,
+                 excit_current: float = 0.004):
         if not _NIDAQMX_AVAILABLE:
             raise RuntimeError("nidaqmx is not installed")
         self._device_name = device_name
@@ -197,10 +199,11 @@ class PXIe4492(_DAQBase):
         self._record_length: int = 1024
         self._voltage_range: float = voltage_range
         self._sensitivity = sensitivity       # 가속도계 감도 mV/(m/s²)
-        self._convert = convert_to_accel      # True면 전압→물리단위 변환
-        # 마이크로폰 채널: 4492 로컬 ai 인덱스 집합(0~7). 해당 채널은 전압→음압(Pa) 변환.
+        self._convert = convert_to_accel      # (호환 유지용; 드라이버가 물리단위 반환하므로 미사용)
+        # 마이크로폰 채널: 4492 로컬 ai 인덱스 집합(0~7). 해당 채널은 마이크(Pa), 그 외 가속도계(m/s²).
         self._mic_locals = set(int(c) for c in (mic_channels or []))
         self._mic_sensitivity = float(mic_sensitivity)  # mV/Pa
+        self._excit_current = float(excit_current)      # IEPE 전류 (A), 4464와 동일 기본 4mA
         self._task: Optional[nidaqmx.Task] = None
         self._reader: Optional[AnalogMultiChannelReader] = None
         self._buffer: Optional[np.ndarray] = None
@@ -212,30 +215,40 @@ class PXIe4492(_DAQBase):
         self._voltage_range = float(voltage_range)
         self._sensitivity = float(sensitivity)
 
-    def _to_accel(self, buffer: np.ndarray) -> np.ndarray:
-        """채널별 물리단위 변환.
-        - 마이크로폰 채널(mic_locals): 전압[V] → 음압[Pa]  (V × 1000 / (mV/Pa))
-        - 그 외(가속도계): 전압[V] → 가속도[m/s²]        (V × 1000 / (mV/(m/s²)))
-        """
-        if not self._convert:
-            return buffer
-        out = buffer.copy()
-        for ch in range(buffer.shape[0]):
-            if ch in self._mic_locals:
-                if self._mic_sensitivity > 0:
-                    out[ch] = buffer[ch] * (1000.0 / self._mic_sensitivity)   # → Pa
-            elif self._sensitivity > 0:
-                out[ch] = buffer[ch] * (1000.0 / self._sensitivity)           # → m/s²
-        return out
-
     def start(self) -> None:
         self._task = nidaqmx.Task()
-        ch = f"{self._device_name}/ai0:{N_CHANNELS_4492 - 1}"
-        self._task.ai_channels.add_ai_voltage_chan(
-            physical_channel=ch,
-            min_val=-self._voltage_range,
-            max_val=self._voltage_range,
-        )
+        # 4464와 동일하게 내부 IEPE로 구동. 채널별로 가속도계/마이크 타입을 지정하면
+        # 드라이버가 IEPE 전류 공급 + 물리단위(m/s², Pa) 변환까지 수행한다.
+        sens_mv_per_g = self._sensitivity * G_TO_MS2           # mV/(m/s²) → mV/g
+        sens_v_per_ms2 = self._sensitivity / 1000.0
+        max_eng = self._voltage_range / sens_v_per_ms2 if sens_v_per_ms2 > 0 else self._voltage_range
+        for ai in range(N_CHANNELS_4492):
+            chan = f"{self._device_name}/ai{ai}"
+            if ai in self._mic_locals:
+                # 마이크로폰(IEPE, Pa). 입력 레인지는 선택 전압범위에 대응하는 최대 SPL로.
+                max_pa = (self._voltage_range / (self._mic_sensitivity / 1000.0)
+                          if self._mic_sensitivity > 0 else 200.0)
+                max_spl = float(20.0 * np.log10(max(max_pa, 1e-9) / 20e-6))
+                self._task.ai_channels.add_ai_microphone_chan(
+                    physical_channel=chan,
+                    units=SoundPressureUnits.PA,
+                    mic_sensitivity=self._mic_sensitivity,
+                    max_snd_press_level=max_spl,
+                    current_excit_source=ExcitationSource.INTERNAL,
+                    current_excit_val=self._excit_current,
+                )
+            else:
+                # 가속도계(IEPE, m/s²) — 4464와 동일 방식
+                self._task.ai_channels.add_ai_accel_chan(
+                    physical_channel=chan,
+                    sensitivity=sens_mv_per_g,
+                    sensitivity_units=AccelSensitivityUnits.MILLIVOLTS_PER_G,
+                    units=AccelUnits.METERS_PER_SECOND_SQUARED,
+                    current_excit_source=ExcitationSource.INTERNAL,
+                    current_excit_val=self._excit_current,
+                    min_val=-max_eng,
+                    max_val=max_eng,
+                )
         self._task.timing.cfg_samp_clk_timing(
             rate=self._sample_rate,
             source="OnboardClock",
@@ -274,7 +287,8 @@ class PXIe4492(_DAQBase):
             )
             if samps_read is None or samps_read < self._record_length:
                 raise RuntimeError(f"Partial read after retry: {samps_read}/{self._record_length}")
-        return self._to_accel(self._buffer.copy())
+        # 드라이버가 이미 물리단위(m/s² / Pa)로 반환 — 추가 스케일링 없음
+        return self._buffer.copy()
 
 
 class MultiDAQ(_DAQBase):
