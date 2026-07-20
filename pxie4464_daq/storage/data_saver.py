@@ -12,6 +12,7 @@ import numpy as np
 from PyQt5.QtCore import QObject, pyqtSlot
 
 from pxie4464_daq.analysis.fft import compute_fft
+from pxie4464_daq.storage import nas_uploader
 
 _log = logging.getLogger(__name__)
 
@@ -19,22 +20,30 @@ _DISK_WARN_GB = 5.0  # 여유 공간이 이 값 미만이면 경고
 
 
 class DataSaver(QObject):
-    """주기적으로 n채널 raw 파형과 FFT 스펙트럼을 CSV로 자동 저장.
+    """주기적으로 n채널 raw 파형(.npz)과 FFT 스펙트럼(CSV)을 자동 저장.
 
     FeatureCollector.raw_ready 시그널에 연결하여 사용.
-    save_interval_sec 마다 한 번만 실제 파일을 기록한다 (기본 30분).
+    save_interval_sec 마다 한 번만 실제 파일을 기록한다 (0이면 매 사이클 저장).
+
+    raw는 float32 .npz(data, sample_rate, unit)로 저장 — CSV 대비 쓰기가 빠르다.
+    nas_dir이 지정되면 로컬 저장 직후 파일들을 백그라운드로 NAS에 복사한다.
+
+    .npz 읽기: d = numpy.load("..._raw.npz"); arr = d["data"]; sr = float(d["sample_rate"])
 
     Slots:
         on_raw(datetime, np.ndarray): (timestamp, shape (n, N)) 수신 시 주기 판단 후 저장
     """
 
     def __init__(self, sample_rate: float, save_dir: str | Path = "results",
-                 save_interval_sec: float = 1800.0, parent=None):
+                 save_interval_sec: float = 1800.0, nas_dir: Optional[str | Path] = None,
+                 delete_after_upload: bool = False, parent=None):
         super().__init__(parent)
         self._sample_rate = sample_rate
         self._save_dir = Path(save_dir)
         self._save_dir.mkdir(parents=True, exist_ok=True)
         self._save_interval_sec = save_interval_sec
+        self._nas_dir = Path(nas_dir) if nas_dir else None
+        self._delete_after = delete_after_upload
         self._last_save_time: Optional[datetime] = None
         self._save_count: int = 0
 
@@ -64,19 +73,23 @@ class DataSaver(QObject):
             self._write_fft(stem, data)
             elapsed_w = time.monotonic() - t_start
 
-            # 저장된 파일 크기 합산
-            fnames = [f"{stem}_raw.csv"] + [f"{stem}_fft_ch{ch}.csv" for ch in range(n_ch)]
-            size_kb = sum(
-                (self._save_dir / f).stat().st_size
-                for f in fnames
-                if (self._save_dir / f).exists()
-            ) / 1024
+            # 저장된 파일 목록/크기 합산 (raw는 .npz, FFT는 채널별 CSV)
+            fnames = [f"{stem}_raw.npz"] + [f"{stem}_fft_ch{ch}.csv" for ch in range(n_ch)]
+            saved_paths = [self._save_dir / f for f in fnames if (self._save_dir / f).exists()]
+            size_kb = sum(p.stat().st_size for p in saved_paths) / 1024
 
             self._save_count += 1
             self._last_save_time = timestamp
+
+            # NAS 백그라운드 전송 (로컬 저장 직후, 메인 스레드 비차단)
+            nas_note = ""
+            if self._nas_dir is not None:
+                nas_uploader.enqueue(saved_paths, self._nas_dir, self._delete_after)
+                nas_note = " | NAS전송 예약(대기 %d)" % nas_uploader.pending_count()
+
             _log.info(
-                "[저장완료 #%d] %s | %d채널 | %.1f KB | 쓰기 %.2f초 | 디스크여유 %.1f GB",
-                self._save_count, stem, n_ch, size_kb, elapsed_w, free_gb,
+                "[저장완료 #%d] %s | %d채널 | %.1f KB | 쓰기 %.2f초 | 디스크여유 %.1f GB%s",
+                self._save_count, stem, n_ch, size_kb, elapsed_w, free_gb, nas_note,
             )
         except OSError as exc:
             elapsed_f = time.monotonic() - t_start
@@ -86,16 +99,18 @@ class DataSaver(QObject):
             )
 
     def _write_raw(self, stem: str, data: np.ndarray) -> None:
-        """n채널 원시 데이터를 하나의 CSV에 저장 (컬럼: time_s, ch0..chN-1)."""
-        n_ch = data.shape[0]
-        path = self._save_dir / f"{stem}_raw.csv"
-        n = data.shape[1]
-        time_arr = np.arange(n) / self._sample_rate
-        with path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["time_s"] + [f"ch{ch}" for ch in range(n_ch)])
-            for i, t in enumerate(time_arr):
-                writer.writerow([f"{t:.8f}"] + [f"{data[ch, i]:.8f}" for ch in range(n_ch)])
+        """n채널 원시 데이터를 .npz(float32)로 저장 — 시간축은 sample_rate로 복원.
+
+        time_s[i] = i / sample_rate.  단위는 m/s².
+        """
+        path = self._save_dir / f"{stem}_raw.npz"
+        np.savez(
+            path,
+            data=data.astype(np.float32),
+            sample_rate=np.float64(self._sample_rate),
+            unit="m/s^2",
+            timestamp=stem,
+        )
 
     def _write_fft(self, stem: str, data: np.ndarray) -> None:
         """n채널 FFT 스펙트럼을 채널별 CSV로 저장."""

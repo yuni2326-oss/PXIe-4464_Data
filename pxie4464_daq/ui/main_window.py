@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 VOLTAGE_RANGES = [1.0, 3.16, 10.0, 31.6]
 N_TOTAL_MAX = N_CHANNELS_4464 + N_CHANNELS_4492  # 12
 
+# NAS 전송 기본 경로 (네트워크 드라이브 UNC)
+DEFAULT_NAS_DIR = r"\\10.130.121.158\ai_gpu_001\GY_DATA\pump data"
+
 # 자동 재시작 백오프 파라미터
 RESTART_BASE_SEC = 5       # 첫 재시도 지연
 RESTART_MAX_SEC = 300      # 지연 상한 (5분)
@@ -198,6 +201,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._subdir_edit, row, 1)
         row += 1
 
+        # NAS 전송 경로 — 비우면 전송 안 함. 로컬 저장 직후 백그라운드로 복사.
+        layout.addWidget(QLabel("NAS 전송 경로"), row, 0)
+        self._nas_edit = QLineEdit(DEFAULT_NAS_DIR)
+        self._nas_edit.setPlaceholderText("비우면 NAS 전송 안 함")
+        layout.addWidget(self._nas_edit, row, 1)
+        row += 1
+
+        self._nas_delete_check = QCheckBox("NAS 전송 후 로컬 삭제")
+        self._nas_delete_check.setChecked(False)
+        layout.addWidget(self._nas_delete_check, row, 0, 1, 2)
+        row += 1
+
         self._mock_check = QCheckBox("Mock 모드")
         self._mock_check.setChecked(True)
         layout.addWidget(self._mock_check, row, 0, 1, 2)
@@ -315,6 +330,8 @@ class MainWindow(QMainWindow):
             "save_interval_sec": float(self._save_interval_edit.text()) * 60.0,
             "sensitivity": float(self._sensitivity_edit.text()),
             "save_subdir": self._subdir_edit.text().strip(),
+            "nas_dir": self._nas_edit.text().strip(),
+            "nas_delete": self._nas_delete_check.isChecked(),
             "use_4492": use_4492,
             "mock": self._mock_check.isChecked(),
             "dev4464": self._dev4464_edit.text(),
@@ -377,9 +394,16 @@ class MainWindow(QMainWindow):
 
         subdir = (cfg.get("save_subdir") or "").strip()
         save_dir = str(Path("results") / subdir) if subdir else "results"
+        # NAS 대상: 하위폴더 구조를 그대로 미러링 (<NAS>/<subdir>)
+        nas_root = (cfg.get("nas_dir") or "").strip()
+        nas_dir = None
+        if nas_root:
+            nas_dir = str(Path(nas_root) / subdir) if subdir else nas_root
         self._data_saver = DataSaver(sample_rate=sample_rate, save_dir=save_dir,
-                                     save_interval_sec=cfg["save_interval_sec"])
-        logger.info("저장 폴더: %s", save_dir)
+                                     save_interval_sec=cfg["save_interval_sec"],
+                                     nas_dir=nas_dir,
+                                     delete_after_upload=cfg.get("nas_delete", False))
+        logger.info("저장 폴더: %s | NAS: %s", save_dir, nas_dir or "(사용 안 함)")
         self._collector.raw_ready.connect(self._data_saver.on_raw)
         logger.info("파이프라인 구성: %s, 활성 채널=%s, sr=%.0f",
                     type(self._daq).__name__, self._enabled_indices, sample_rate)
@@ -435,6 +459,8 @@ class MainWindow(QMainWindow):
         self._save_interval_edit.setText(_fmt(cfg["save_interval_sec"] / 60.0))
         self._sensitivity_edit.setText(_fmt(cfg.get("sensitivity", DEFAULT_SENSITIVITY)))
         self._subdir_edit.setText(cfg.get("save_subdir", ""))
+        self._nas_edit.setText(cfg.get("nas_dir", DEFAULT_NAS_DIR))
+        self._nas_delete_check.setChecked(bool(cfg.get("nas_delete", False)))
         self._mock_check.setChecked(bool(cfg.get("mock", True)))
         enabled = set(cfg.get("enabled_indices", []))
         for i, cb in enumerate(self._ch_checks):
