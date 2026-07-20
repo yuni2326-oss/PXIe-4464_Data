@@ -191,7 +191,7 @@ class PXIe4492(_DAQBase):
     def __init__(self, device_name: str = "PXI1Slot5", voltage_range: float = 10.0,
                  sensitivity: float = DEFAULT_SENSITIVITY, convert_to_accel: bool = True,
                  mic_channels=None, mic_sensitivity: float = 50.0,
-                 excit_current: float = 0.004):
+                 mic_max_spl: float = 130.0, excit_current: float = 0.004):
         if not _NIDAQMX_AVAILABLE:
             raise RuntimeError("nidaqmx is not installed")
         self._device_name = device_name
@@ -203,6 +203,9 @@ class PXIe4492(_DAQBase):
         # 마이크로폰 채널: 4492 로컬 ai 인덱스 집합(0~7). 해당 채널은 마이크(Pa), 그 외 가속도계(m/s²).
         self._mic_locals = set(int(c) for c in (mic_channels or []))
         self._mic_sensitivity = float(mic_sensitivity)  # mV/Pa
+        # 마이크 최대 SPL(dB). 감도와 조합해 입력 레인지를 정한다. 너무 높으면 장비가
+        # 지원하는 레인지를 초과해 오류(-200860). 130dB≈63Pa≈3.16V(±5V IEPE 레인지 내).
+        self._mic_max_spl = float(mic_max_spl)
         self._excit_current = float(excit_current)      # IEPE 전류 (A), 4464와 동일 기본 4mA
         self._task: Optional[nidaqmx.Task] = None
         self._reader: Optional[AnalogMultiChannelReader] = None
@@ -225,15 +228,12 @@ class PXIe4492(_DAQBase):
         for ai in range(N_CHANNELS_4492):
             chan = f"{self._device_name}/ai{ai}"
             if ai in self._mic_locals:
-                # 마이크로폰(IEPE, Pa). 입력 레인지는 선택 전압범위에 대응하는 최대 SPL로.
-                max_pa = (self._voltage_range / (self._mic_sensitivity / 1000.0)
-                          if self._mic_sensitivity > 0 else 200.0)
-                max_spl = float(20.0 * np.log10(max(max_pa, 1e-9) / 20e-6))
+                # 마이크로폰(IEPE, Pa). 최대 SPL은 UI 지정값 사용(감도와 조합해 레인지 결정).
                 self._task.ai_channels.add_ai_microphone_chan(
                     physical_channel=chan,
                     units=SoundPressureUnits.PA,
                     mic_sensitivity=self._mic_sensitivity,
-                    max_snd_press_level=max_spl,
+                    max_snd_press_level=self._mic_max_spl,
                     current_excit_source=ExcitationSource.INTERNAL,
                     current_excit_val=self._excit_current,
                 )

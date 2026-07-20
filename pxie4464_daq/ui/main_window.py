@@ -198,6 +198,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._mic_sens_edit, row, 1)
         row += 1
 
+        # 마이크 최대 SPL(dB) — 너무 높으면 장비 레인지 초과 오류(-200860). 50mV/Pa 기준 130dB 권장.
+        layout.addWidget(QLabel("마이크 최대 SPL (dB)"), row, 0)
+        self._mic_spl_edit = QLineEdit("130")
+        layout.addWidget(self._mic_spl_edit, row, 1)
+        row += 1
+
         layout.addWidget(QLabel("FFT 표시 상한 (Hz)"), row, 0)
         self._fft_max_edit = QLineEdit("5000")
         layout.addWidget(self._fft_max_edit, row, 1)
@@ -360,6 +366,7 @@ class MainWindow(QMainWindow):
             "sensitivity": float(self._sensitivity_edit.text()),
             "mic_channels": _parse_int_list(self._mic_ch_edit.text()),
             "mic_sensitivity": float(self._mic_sens_edit.text() or 50.0),
+            "mic_max_spl": float(self._mic_spl_edit.text() or 130.0),
             "fft_max_hz": float(self._fft_max_edit.text() or 5000.0),
             "save_subdir": self._subdir_edit.text().strip(),
             "nas_dir": self._nas_edit.text().strip(),
@@ -402,7 +409,8 @@ class MainWindow(QMainWindow):
                                     voltage_range=cfg["voltage_range"],
                                     sensitivity=sensitivity,
                                     mic_channels=mic_locals,
-                                    mic_sensitivity=cfg.get("mic_sensitivity", 50.0))
+                                    mic_sensitivity=cfg.get("mic_sensitivity", 50.0),
+                                    mic_max_spl=cfg.get("mic_max_spl", 130.0))
                 self._daq = MultiDAQ(daq_4464, daq_4492)
             else:
                 self._daq = daq_4464
@@ -498,6 +506,7 @@ class MainWindow(QMainWindow):
         self._sensitivity_edit.setText(_fmt(cfg.get("sensitivity", DEFAULT_SENSITIVITY)))
         self._mic_ch_edit.setText(" ".join(str(c) for c in cfg.get("mic_channels", [])))
         self._mic_sens_edit.setText(_fmt(cfg.get("mic_sensitivity", 50.0)))
+        self._mic_spl_edit.setText(_fmt(cfg.get("mic_max_spl", 130.0)))
         self._fft_max_edit.setText(_fmt(cfg.get("fft_max_hz", 5000.0)))
         self._subdir_edit.setText(cfg.get("save_subdir", ""))
         self._nas_edit.setText(cfg.get("nas_dir", DEFAULT_NAS_DIR))
