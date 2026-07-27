@@ -15,6 +15,9 @@ try:
         AccelSensitivityUnits,
         AccelUnits,
         SoundPressureUnits,
+        ThermocoupleType,
+        CJCSource,
+        TemperatureUnits,
         Edge,
     )
     from nidaqmx.stream_readers import AnalogMultiChannelReader
@@ -289,6 +292,60 @@ class PXIe4492(_DAQBase):
                 raise RuntimeError(f"Partial read after retry: {samps_read}/{self._record_length}")
         # 드라이버가 이미 물리단위(m/s² / Pa)로 반환 — 추가 스케일링 없음
         return self._buffer.copy()
+
+
+class PXIe4353:
+    """NI PXIe-4353 열전대 온도 측정 (저속·온디맨드).
+
+    진동 DSA 모듈(51.2 kS/s 연속)과 달리 저속 장치이므로 별도 태스크로
+    온디맨드 단일 읽기를 수행한다. TB-4353의 내장 CJC(BUILT_IN) 사용.
+
+    read() → shape (n_channels,) 섭씨 온도 배열 (1회 변환).
+    """
+
+    def __init__(self, device_name: str = "PXI1Slot8", channels=(0, 1),
+                 tc_type: str = "K", min_val: float = 0.0, max_val: float = 1000.0):
+        if not _NIDAQMX_AVAILABLE:
+            raise RuntimeError("nidaqmx is not installed")
+        self._device_name = device_name
+        self._channels = [int(c) for c in channels]
+        self._tc_type = str(tc_type).upper()
+        self._min_val = float(min_val)
+        self._max_val = float(max_val)
+        self._task: Optional[nidaqmx.Task] = None
+
+    def start(self) -> None:
+        self._task = nidaqmx.Task()
+        tc = ThermocoupleType[self._tc_type]
+        for ch in self._channels:
+            self._task.ai_channels.add_ai_thrmcpl_chan(
+                physical_channel=f"{self._device_name}/ai{ch}",
+                min_val=self._min_val,
+                max_val=self._max_val,
+                units=TemperatureUnits.DEG_C,
+                thermocouple_type=tc,
+                cjc_source=CJCSource.BUILT_IN,
+            )
+        # 샘플클럭 미설정 = 온디맨드(소프트웨어 타이밍) 단일 읽기
+        self._task.start()
+
+    def read(self) -> np.ndarray:
+        if self._task is None:
+            raise RuntimeError("PXIe4353 not started. Call start() first.")
+        vals = self._task.read()  # 채널 1개면 scalar, 여러 개면 list
+        if not isinstance(vals, list):
+            vals = [vals]
+        return np.array(vals, dtype=np.float64)
+
+    def stop(self) -> None:
+        if self._task is not None:
+            try:
+                self._task.stop()
+                self._task.close()
+            except Exception as exc:
+                logger.warning("PXIe4353 task cleanup error (ignored): %s", exc)
+            finally:
+                self._task = None
 
 
 class MultiDAQ(_DAQBase):

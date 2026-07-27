@@ -15,9 +15,10 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer
 
 from pxie4464_daq.device.daq import (
-    MockDAQ, PXIe4464, PXIe4492, MultiDAQ, _DAQBase,
+    MockDAQ, PXIe4464, PXIe4492, PXIe4353, MultiDAQ, _DAQBase,
     N_CHANNELS_4464, N_CHANNELS_4492, DEFAULT_SENSITIVITY,
 )
+from pxie4464_daq.device.temp_monitor import TemperatureMonitor
 from pxie4464_daq.acquisition.worker import AcquisitionWorker
 from pxie4464_daq.analysis.fft import compute_fft
 from pxie4464_daq.analysis.feature_collector import FeatureCollector
@@ -36,6 +37,10 @@ N_TOTAL_MAX = N_CHANNELS_4464 + N_CHANNELS_4492  # 12
 
 # NAS 전송 기본 경로 (네트워크 드라이브 UNC)
 DEFAULT_NAS_DIR = r"\\10.130.121.158\ai_gpu_001\GY_DATA\pump data"
+
+# 온도(PXIe-4353) 기본값
+DEFAULT_TEMP_DEV = "PXI1Slot8"
+TC_TYPES = ["K", "J", "T", "E", "N", "R", "S", "B"]  # 열전대 종류
 
 
 def _parse_int_list(text: str) -> list:
@@ -94,6 +99,12 @@ class MainWindow(QMainWindow):
         self._stable_timer = QTimer(self)
         self._stable_timer.setSingleShot(True)
         self._stable_timer.timeout.connect(self._on_stable)
+        # 온도 모니터 (PXIe-4353, 저속 별도 폴링)
+        self._temp_daq = None
+        self._temp_monitor = TemperatureMonitor(self)
+        self._temp_monitor.reading.connect(self._on_temperature)
+        self._temp_monitor.failed.connect(self._on_temp_error)
+        self._temp_save_dir = Path("results")
         self._start_heartbeat()
         self._start_heartbeat_file()
 
@@ -112,6 +123,7 @@ class MainWindow(QMainWindow):
         ctrl_layout = QVBoxLayout(ctrl_container)
         ctrl_layout.addWidget(self._make_device_panel())
         ctrl_layout.addWidget(self._make_channel_panel())
+        ctrl_layout.addWidget(self._make_temp_panel())
         ctrl_layout.addWidget(self._make_action_panel())
         ctrl_layout.addStretch()
         scroll.setWidget(ctrl_container)
@@ -280,6 +292,45 @@ class MainWindow(QMainWindow):
 
         return group
 
+    def _make_temp_panel(self) -> QGroupBox:
+        group = QGroupBox("온도 센서 (PXIe-4353)")
+        layout = QGridLayout(group)
+        row = 0
+
+        self._temp_use_check = QCheckBox("온도 측정 사용")
+        self._temp_use_check.setChecked(False)
+        layout.addWidget(self._temp_use_check, row, 0, 1, 2)
+        row += 1
+
+        layout.addWidget(QLabel("장치명"), row, 0)
+        self._temp_dev_edit = QLineEdit(DEFAULT_TEMP_DEV)
+        layout.addWidget(self._temp_dev_edit, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("채널 (ai)"), row, 0)
+        self._temp_ch_edit = QLineEdit("0, 1")
+        self._temp_ch_edit.setPlaceholderText("예: 0, 1")
+        layout.addWidget(self._temp_ch_edit, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("열전대 종류"), row, 0)
+        self._temp_tc_combo = QComboBox()
+        for t in TC_TYPES:
+            self._temp_tc_combo.addItem(f"{t}형", t)
+        layout.addWidget(self._temp_tc_combo, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("측정 주기 (s)"), row, 0)
+        self._temp_interval_edit = QLineEdit("2")
+        layout.addWidget(self._temp_interval_edit, row, 1)
+        row += 1
+
+        self._temp_label = QLabel("온도: —")
+        self._temp_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self._temp_label, row, 0, 1, 2)
+
+        return group
+
     def _make_action_panel(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -371,6 +422,11 @@ class MainWindow(QMainWindow):
             "save_subdir": self._subdir_edit.text().strip(),
             "nas_dir": self._nas_edit.text().strip(),
             "nas_delete": self._nas_delete_check.isChecked(),
+            "temp_use": self._temp_use_check.isChecked(),
+            "temp_dev": self._temp_dev_edit.text().strip(),
+            "temp_channels": _parse_int_list(self._temp_ch_edit.text()),
+            "temp_tc_type": self._temp_tc_combo.currentData(),
+            "temp_interval": float(self._temp_interval_edit.text() or 2.0),
             "use_4492": use_4492,
             "mock": self._mock_check.isChecked(),
             "dev4464": self._dev4464_edit.text(),
@@ -454,6 +510,20 @@ class MainWindow(QMainWindow):
         logger.info("파이프라인 구성: %s, 활성 채널=%s, sr=%.0f",
                     type(self._daq).__name__, self._enabled_indices, sample_rate)
 
+        # 온도 센서(PXIe-4353) — 저속 별도 폴링. 진동 스트림과 무관.
+        self._temp_save_dir = Path(save_dir)
+        self._temp_daq = None
+        self._temp_interval = float(cfg.get("temp_interval", 2.0))
+        self._temp_channels = list(cfg.get("temp_channels", []))
+        if cfg.get("temp_use") and not cfg.get("mock") and self._temp_channels:
+            self._temp_daq = PXIe4353(
+                device_name=cfg.get("temp_dev", DEFAULT_TEMP_DEV),
+                channels=self._temp_channels,
+                tc_type=cfg.get("temp_tc_type", "K"),
+            )
+            logger.info("온도 센서 구성: %s ai%s, %s형 열전대",
+                        cfg.get("temp_dev"), self._temp_channels, cfg.get("temp_tc_type"))
+
     def _on_connect(self):
         try:
             cfg = self._read_config()
@@ -511,6 +581,13 @@ class MainWindow(QMainWindow):
         self._subdir_edit.setText(cfg.get("save_subdir", ""))
         self._nas_edit.setText(cfg.get("nas_dir", DEFAULT_NAS_DIR))
         self._nas_delete_check.setChecked(bool(cfg.get("nas_delete", False)))
+        self._temp_use_check.setChecked(bool(cfg.get("temp_use", False)))
+        self._temp_dev_edit.setText(cfg.get("temp_dev", DEFAULT_TEMP_DEV))
+        self._temp_ch_edit.setText(", ".join(str(c) for c in cfg.get("temp_channels", [0, 1])))
+        ti = self._temp_tc_combo.findData(cfg.get("temp_tc_type", "K"))
+        if ti >= 0:
+            self._temp_tc_combo.setCurrentIndex(ti)
+        self._temp_interval_edit.setText(_fmt(cfg.get("temp_interval", 2.0)))
         self._mock_check.setChecked(bool(cfg.get("mock", True)))
         enabled = set(cfg.get("enabled_indices", []))
         for i, cb in enumerate(self._ch_checks):
@@ -553,6 +630,9 @@ class MainWindow(QMainWindow):
         self._worker.error_occurred.connect(self._on_error)
         self._collector.start()
         self._worker.start()
+        # 온도 모니터 시작 (사용 설정 시)
+        if self._temp_daq is not None:
+            self._temp_monitor.start(self._temp_daq, self._temp_interval)
         self._start_btn.setText("■ 정지")
         self._save_btn.setEnabled(True)
         logger.info("수집 시작: DAQ=%s, 채널=%s", type(self._daq).__name__, self._enabled_indices)
@@ -569,6 +649,7 @@ class MainWindow(QMainWindow):
             self._worker = None
         if self._collector:
             self._collector.stop()
+        self._temp_monitor.stop()
         self._start_btn.setText("▶ 시작")
         logger.info("수집 정지%s", "" if manual else " (오류)")
 
@@ -603,6 +684,27 @@ class MainWindow(QMainWindow):
                 lambda: self._anomaly_plot.update(self._detector.if_scores(), self._enabled_indices),
                 "anomaly",
             )
+
+    def _on_temperature(self, timestamp, temps):
+        """온도 모니터 슬롯 (메인 스레드). 라벨 표시 + 일자별 CSV 로그."""
+        chs = self._temp_channels
+        parts = [f"ai{chs[i]}: {temps[i]:.1f}℃" for i in range(min(len(chs), len(temps)))]
+        self._temp_label.setText("온도  " + "   ".join(parts))
+        try:
+            self._temp_save_dir.mkdir(parents=True, exist_ok=True)
+            path = self._temp_save_dir / ("temperature_%s.csv" % timestamp.strftime("%Y%m%d"))
+            is_new = not path.exists()
+            with path.open("a", encoding="utf-8") as f:
+                if is_new:
+                    f.write("timestamp," + ",".join(f"ai{ch}_C" for ch in chs) + "\n")
+                cells = [f"{temps[i]:.3f}" if i < len(temps) else "" for i in range(len(chs))]
+                f.write(timestamp.strftime("%Y-%m-%d %H:%M:%S") + "," + ",".join(cells) + "\n")
+        except Exception as exc:
+            logger.warning("온도 로그 저장 실패: %s", exc)
+
+    def _on_temp_error(self, msg: str):
+        logger.error("온도 측정 오류: %s", msg)
+        self._temp_label.setText(f"온도: 오류 ({msg[:40]})")
 
     def _safe_plot(self, fn, name: str) -> None:
         """플롯 갱신을 보호 실행. pyqtgraph TypeError(Python 3.14+SIP)가
