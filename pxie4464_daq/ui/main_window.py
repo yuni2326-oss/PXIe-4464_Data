@@ -25,6 +25,7 @@ from pxie4464_daq.analysis.feature_collector import FeatureCollector
 from pxie4464_daq.analysis.anomaly_detector import AnomalyDetector
 from pxie4464_daq.storage.csv_writer import save_raw, save_fft
 from pxie4464_daq.storage.data_saver import DataSaver
+from pxie4464_daq.storage import nas_uploader
 from pxie4464_daq.ui.waveform_plot import WaveformPlot
 from pxie4464_daq.ui.fft_plot import FFTPlot
 from pxie4464_daq.ui.anomaly_plot import AnomalyPlot
@@ -41,6 +42,7 @@ DEFAULT_NAS_DIR = r"\\10.130.121.158\ai_gpu_001\GY_DATA\pump data"
 # 온도(PXIe-4353) 기본값
 DEFAULT_TEMP_DEV = "PXI1Slot8"
 TC_TYPES = ["K", "J", "T", "E", "N", "R", "S", "B"]  # 열전대 종류
+TEMP_NAS_EVERY = 30   # 온도 읽기 N회마다 NAS 전송(계속 append되는 파일이라 스로틀)
 
 
 def _parse_int_list(text: str) -> list:
@@ -105,6 +107,10 @@ class MainWindow(QMainWindow):
         self._temp_monitor.reading.connect(self._on_temperature)
         self._temp_monitor.failed.connect(self._on_temp_error)
         self._temp_save_dir = Path("results")
+        self._temp_channels: List[int] = []
+        self._temp_write_count = 0
+        self._temp_csv_path = None
+        self._nas_dir = None
         self._start_heartbeat()
         self._start_heartbeat_file()
 
@@ -512,9 +518,12 @@ class MainWindow(QMainWindow):
 
         # 온도 센서(PXIe-4353) — 저속 별도 폴링. 진동 스트림과 무관.
         self._temp_save_dir = Path(save_dir)
+        self._nas_dir = nas_dir          # 온도 CSV도 같은 NAS 폴더로 전송
         self._temp_daq = None
         self._temp_interval = float(cfg.get("temp_interval", 2.0))
         self._temp_channels = list(cfg.get("temp_channels", []))
+        self._temp_write_count = 0
+        self._temp_csv_path = None
         if cfg.get("temp_use") and not cfg.get("mock") and self._temp_channels:
             self._temp_daq = PXIe4353(
                 device_name=cfg.get("temp_dev", DEFAULT_TEMP_DEV),
@@ -650,6 +659,9 @@ class MainWindow(QMainWindow):
         if self._collector:
             self._collector.stop()
         self._temp_monitor.stop()
+        # 온도 CSV 최신본 NAS로 최종 전송(정지 시 flush)
+        if self._nas_dir and self._temp_csv_path is not None:
+            nas_uploader.enqueue([self._temp_csv_path], self._nas_dir, delete_after=False)
         self._start_btn.setText("▶ 시작")
         logger.info("수집 정지%s", "" if manual else " (오류)")
 
@@ -699,6 +711,12 @@ class MainWindow(QMainWindow):
                     f.write("timestamp," + ",".join(f"ai{ch}_C" for ch in chs) + "\n")
                 cells = [f"{temps[i]:.3f}" if i < len(temps) else "" for i in range(len(chs))]
                 f.write(timestamp.strftime("%Y-%m-%d %H:%M:%S") + "," + ",".join(cells) + "\n")
+            self._temp_csv_path = path
+            # NAS 전송(스로틀): 계속 append되는 파일이라 N회마다 최신본 복사.
+            # 항상 delete_after=False (append 파일이 지워지면 안 됨).
+            self._temp_write_count += 1
+            if self._nas_dir and self._temp_write_count % TEMP_NAS_EVERY == 0:
+                nas_uploader.enqueue([path], self._nas_dir, delete_after=False)
         except Exception as exc:
             logger.warning("온도 로그 저장 실패: %s", exc)
 
