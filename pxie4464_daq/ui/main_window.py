@@ -42,7 +42,8 @@ DEFAULT_NAS_DIR = r"\\10.130.121.158\ai_gpu_001\GY_DATA\pump data"
 # 온도(PXIe-4353) 기본값
 DEFAULT_TEMP_DEV = "PXI1Slot8"
 TC_TYPES = ["K", "J", "T", "E", "N", "R", "S", "B"]  # 열전대 종류
-TEMP_NAS_EVERY = 30   # 온도 읽기 N회마다 NAS 전송(계속 append되는 파일이라 스로틀)
+DEFAULT_TEMP_INTERVAL = 120.0  # 온도 측정 주기 기본값(초)
+TEMP_NAS_EVERY = 1    # 온도 읽기 N회마다 NAS 전송 (1 = 매 측정마다 = 측정주기 간격으로 전송)
 
 
 def _parse_int_list(text: str) -> list:
@@ -327,7 +328,7 @@ class MainWindow(QMainWindow):
         row += 1
 
         layout.addWidget(QLabel("측정 주기 (s)"), row, 0)
-        self._temp_interval_edit = QLineEdit("2")
+        self._temp_interval_edit = QLineEdit("120")
         layout.addWidget(self._temp_interval_edit, row, 1)
         row += 1
 
@@ -432,7 +433,7 @@ class MainWindow(QMainWindow):
             "temp_dev": self._temp_dev_edit.text().strip(),
             "temp_channels": _parse_int_list(self._temp_ch_edit.text()),
             "temp_tc_type": self._temp_tc_combo.currentData(),
-            "temp_interval": float(self._temp_interval_edit.text() or 2.0),
+            "temp_interval": float(self._temp_interval_edit.text() or DEFAULT_TEMP_INTERVAL),
             "use_4492": use_4492,
             "mock": self._mock_check.isChecked(),
             "dev4464": self._dev4464_edit.text(),
@@ -520,7 +521,7 @@ class MainWindow(QMainWindow):
         self._temp_save_dir = Path(save_dir)
         self._nas_dir = nas_dir          # 온도 CSV도 같은 NAS 폴더로 전송
         self._temp_daq = None
-        self._temp_interval = float(cfg.get("temp_interval", 2.0))
+        self._temp_interval = float(cfg.get("temp_interval", DEFAULT_TEMP_INTERVAL))
         self._temp_channels = list(cfg.get("temp_channels", []))
         self._temp_write_count = 0
         self._temp_csv_path = None
@@ -596,7 +597,7 @@ class MainWindow(QMainWindow):
         ti = self._temp_tc_combo.findData(cfg.get("temp_tc_type", "K"))
         if ti >= 0:
             self._temp_tc_combo.setCurrentIndex(ti)
-        self._temp_interval_edit.setText(_fmt(cfg.get("temp_interval", 2.0)))
+        self._temp_interval_edit.setText(_fmt(cfg.get("temp_interval", DEFAULT_TEMP_INTERVAL)))
         self._mock_check.setChecked(bool(cfg.get("mock", True)))
         enabled = set(cfg.get("enabled_indices", []))
         for i, cb in enumerate(self._ch_checks):
