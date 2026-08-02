@@ -36,7 +36,7 @@ class DataSaver(QObject):
 
     def __init__(self, sample_rate: float, save_dir: str | Path = "results",
                  save_interval_sec: float = 1800.0, nas_dir: Optional[str | Path] = None,
-                 delete_after_upload: bool = False, parent=None):
+                 delete_after_upload: bool = False, save_fft: bool = True, parent=None):
         super().__init__(parent)
         self._sample_rate = sample_rate
         self._save_dir = Path(save_dir)
@@ -44,6 +44,7 @@ class DataSaver(QObject):
         self._save_interval_sec = save_interval_sec
         self._nas_dir = Path(nas_dir) if nas_dir else None
         self._delete_after = delete_after_upload
+        self._save_fft = save_fft   # False면 FFT CSV 생략(raw npz만) — 긴 윈도우 저장 부담 회피
         self._last_save_time: Optional[datetime] = None
         self._save_count: int = 0
 
@@ -70,11 +71,14 @@ class DataSaver(QObject):
         t_start = time.monotonic()
         try:
             self._write_raw(stem, data)
-            self._write_fft(stem, data)
+            if self._save_fft:
+                self._write_fft(stem, data)
             elapsed_w = time.monotonic() - t_start
 
-            # 저장된 파일 목록/크기 합산 (raw는 .npz, FFT는 채널별 CSV)
-            fnames = [f"{stem}_raw.npz"] + [f"{stem}_fft_ch{ch}.csv" for ch in range(n_ch)]
+            # 저장된 파일 목록/크기 합산 (raw는 .npz, FFT는 채널별 CSV — 옵션)
+            fnames = [f"{stem}_raw.npz"]
+            if self._save_fft:
+                fnames += [f"{stem}_fft_ch{ch}.csv" for ch in range(n_ch)]
             saved_paths = [self._save_dir / f for f in fnames if (self._save_dir / f).exists()]
             size_kb = sum(p.stat().st_size for p in saved_paths) / 1024
 

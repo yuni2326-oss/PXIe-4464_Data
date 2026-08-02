@@ -267,6 +267,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._nas_delete_check, row, 0, 1, 2)
         row += 1
 
+        # FFT 파일 저장 — 끄면 raw npz만 저장(긴 윈도우 저장 부담·쓰기시간 크게 감소)
+        self._save_fft_check = QCheckBox("FFT 파일 저장")
+        self._save_fft_check.setChecked(True)
+        layout.addWidget(self._save_fft_check, row, 0, 1, 2)
+        row += 1
+
         self._mock_check = QCheckBox("Mock 모드")
         self._mock_check.setChecked(True)
         layout.addWidget(self._mock_check, row, 0, 1, 2)
@@ -429,6 +435,7 @@ class MainWindow(QMainWindow):
             "save_subdir": self._subdir_edit.text().strip(),
             "nas_dir": self._nas_edit.text().strip(),
             "nas_delete": self._nas_delete_check.isChecked(),
+            "save_fft": self._save_fft_check.isChecked(),
             "temp_use": self._temp_use_check.isChecked(),
             "temp_dev": self._temp_dev_edit.text().strip(),
             "temp_channels": _parse_int_list(self._temp_ch_edit.text()),
@@ -511,8 +518,10 @@ class MainWindow(QMainWindow):
         self._data_saver = DataSaver(sample_rate=sample_rate, save_dir=save_dir,
                                      save_interval_sec=cfg["save_interval_sec"],
                                      nas_dir=nas_dir,
-                                     delete_after_upload=cfg.get("nas_delete", False))
-        logger.info("저장 폴더: %s | NAS: %s", save_dir, nas_dir or "(사용 안 함)")
+                                     delete_after_upload=cfg.get("nas_delete", False),
+                                     save_fft=cfg.get("save_fft", True))
+        logger.info("저장 폴더: %s | NAS: %s | FFT저장: %s", save_dir,
+                    nas_dir or "(사용 안 함)", "ON" if cfg.get("save_fft", True) else "OFF")
         self._collector.raw_ready.connect(self._data_saver.on_raw)
         logger.info("파이프라인 구성: %s, 활성 채널=%s, sr=%.0f",
                     type(self._daq).__name__, self._enabled_indices, sample_rate)
@@ -591,6 +600,7 @@ class MainWindow(QMainWindow):
         self._subdir_edit.setText(cfg.get("save_subdir", ""))
         self._nas_edit.setText(cfg.get("nas_dir", DEFAULT_NAS_DIR))
         self._nas_delete_check.setChecked(bool(cfg.get("nas_delete", False)))
+        self._save_fft_check.setChecked(bool(cfg.get("save_fft", True)))
         self._temp_use_check.setChecked(bool(cfg.get("temp_use", False)))
         self._temp_dev_edit.setText(cfg.get("temp_dev", DEFAULT_TEMP_DEV))
         self._temp_ch_edit.setText(", ".join(str(c) for c in cfg.get("temp_channels", [0, 1])))
