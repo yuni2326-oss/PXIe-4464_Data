@@ -41,7 +41,7 @@ DEFAULT_NAS_DIR = r"\\10.130.121.158\ai_gpu_001\GY_DATA\pump data"
 
 # 온도(PXIe-4353) 기본값
 DEFAULT_TEMP_DEV = "PXI1Slot8"
-TC_TYPES = ["K", "J", "T", "E", "N", "R", "S", "B"]  # 열전대 종류
+TC_TYPES = ["J", "K", "T", "E", "N", "R", "S", "B"]  # 열전대 종류 (기본 J형)
 DEFAULT_TEMP_INTERVAL = 120.0  # 온도 측정 주기 기본값(초)
 TEMP_NAS_EVERY = 1    # 온도 읽기 N회마다 NAS 전송 (1 = 매 측정마다 = 측정주기 간격으로 전송)
 
@@ -538,7 +538,7 @@ class MainWindow(QMainWindow):
             self._temp_daq = PXIe4353(
                 device_name=cfg.get("temp_dev", DEFAULT_TEMP_DEV),
                 channels=self._temp_channels,
-                tc_type=cfg.get("temp_tc_type", "K"),
+                tc_type=cfg.get("temp_tc_type", "J"),
             )
             logger.info("온도 센서 구성: %s ai%s, %s형 열전대",
                         cfg.get("temp_dev"), self._temp_channels, cfg.get("temp_tc_type"))
@@ -604,7 +604,7 @@ class MainWindow(QMainWindow):
         self._temp_use_check.setChecked(bool(cfg.get("temp_use", False)))
         self._temp_dev_edit.setText(cfg.get("temp_dev", DEFAULT_TEMP_DEV))
         self._temp_ch_edit.setText(", ".join(str(c) for c in cfg.get("temp_channels", [0, 1])))
-        ti = self._temp_tc_combo.findData(cfg.get("temp_tc_type", "K"))
+        ti = self._temp_tc_combo.findData(cfg.get("temp_tc_type", "J"))
         if ti >= 0:
             self._temp_tc_combo.setCurrentIndex(ti)
         self._temp_interval_edit.setText(_fmt(cfg.get("temp_interval", DEFAULT_TEMP_INTERVAL)))

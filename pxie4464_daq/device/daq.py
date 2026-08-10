@@ -304,7 +304,7 @@ class PXIe4353:
     """
 
     def __init__(self, device_name: str = "PXI1Slot8", channels=(0, 1),
-                 tc_type: str = "K", min_val: float = 0.0, max_val: float = 1000.0):
+                 tc_type: str = "J", min_val: float = 0.0, max_val: float = 1000.0):
         if not _NIDAQMX_AVAILABLE:
             raise RuntimeError("nidaqmx is not installed")
         self._device_name = device_name
