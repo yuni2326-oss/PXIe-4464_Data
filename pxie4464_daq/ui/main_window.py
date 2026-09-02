@@ -404,7 +404,7 @@ class MainWindow(QMainWindow):
         row += 1
 
         layout.addWidget(QLabel("채널 (ai)"), row, 0)
-        self._press_ch_edit = QLineEdit("0")
+        self._press_ch_edit = QLineEdit("0, 1")
         self._press_ch_edit.setPlaceholderText("예: 0 또는 0, 1")
         layout.addWidget(self._press_ch_edit, row, 1)
         row += 1
@@ -415,8 +415,8 @@ class MainWindow(QMainWindow):
         row += 1
 
         layout.addWidget(QLabel("압력 범위 (bar, 채널순)"), row, 0)
-        self._press_range_edit = QLineEdit("0:10")
-        self._press_range_edit.setPlaceholderText("예: 0:10  또는  -1:0, 0:10")
+        self._press_range_edit = QLineEdit("0:10, -1:0")
+        self._press_range_edit.setPlaceholderText("예: 0:10  또는  0:10, -1:0")
         layout.addWidget(self._press_range_edit, row, 1)
         row += 1
 
