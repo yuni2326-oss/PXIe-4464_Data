@@ -15,10 +15,11 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer
 
 from pxie4464_daq.device.daq import (
-    MockDAQ, PXIe4464, PXIe4492, PXIe4353, MultiDAQ, _DAQBase,
+    MockDAQ, PXIe4464, PXIe4492, PXIe4353, USB6001Pressure, MultiDAQ, _DAQBase,
     N_CHANNELS_4464, N_CHANNELS_4492, DEFAULT_SENSITIVITY,
 )
 from pxie4464_daq.device.temp_monitor import TemperatureMonitor
+from pxie4464_daq.device.pressure_monitor import PressureMonitor
 from pxie4464_daq.acquisition.worker import AcquisitionWorker
 from pxie4464_daq.analysis.fft import compute_fft
 from pxie4464_daq.analysis.feature_collector import FeatureCollector
@@ -45,6 +46,11 @@ TC_TYPES = ["J", "K", "T", "E", "N", "R", "S", "B"]  # 열전대 종류 (기본 
 DEFAULT_TEMP_INTERVAL = 120.0  # 온도 측정 주기 기본값(초)
 TEMP_NAS_EVERY = 1    # 온도 읽기 N회마다 NAS 전송 (1 = 매 측정마다 = 측정주기 간격으로 전송)
 
+# 압력(USB-6001) 기본값
+DEFAULT_PRESS_DEV = "Dev1"
+DEFAULT_PRESS_INTERVAL = 1.0   # 압력 측정 주기 기본값(초)
+PRESS_NAS_EVERY = 60           # 압력 읽기 N회마다 NAS 전송 (1s 주기 기준 ≈60초)
+
 
 def _parse_int_list(text: str) -> list:
     """쉼표/공백 구분 정수 목록 파싱. 잘못된 항목은 무시."""
@@ -54,6 +60,33 @@ def _parse_int_list(text: str) -> list:
             out.append(int(tok))
         except ValueError:
             pass
+    return out
+
+
+def _parse_float_list(text: str) -> list:
+    """쉼표/공백 구분 실수 목록 파싱."""
+    out = []
+    for tok in (text or "").replace(",", " ").split():
+        try:
+            out.append(float(tok))
+        except ValueError:
+            pass
+    return out
+
+
+def _parse_ranges(text: str) -> list:
+    """'0:10, -1:0' → [(0.0,10.0), (-1.0,0.0)]. 쉼표로 채널 구분, 콜론으로 min:max."""
+    out = []
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            a, b = part.split(":", 1)
+            try:
+                out.append((float(a), float(b)))
+            except ValueError:
+                pass
     return out
 
 # 자동 재시작 백오프 파라미터
@@ -112,6 +145,16 @@ class MainWindow(QMainWindow):
         self._temp_write_count = 0
         self._temp_csv_path = None
         self._nas_dir = None
+        # 압력 모니터 (USB-6001, 저속 별도 폴링)
+        self._pressure_daq = None
+        self._pressure_monitor = PressureMonitor(self)
+        self._pressure_monitor.reading.connect(self._on_pressure)
+        self._pressure_monitor.failed.connect(self._on_pressure_error)
+        self._pressure_channels: List[int] = []
+        self._pressure_ranges: List = []
+        self._pressure_interval = DEFAULT_PRESS_INTERVAL
+        self._pressure_write_count = 0
+        self._pressure_csv_path = None
         self._start_heartbeat()
         self._start_heartbeat_file()
 
@@ -131,6 +174,7 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(self._make_device_panel())
         ctrl_layout.addWidget(self._make_channel_panel())
         ctrl_layout.addWidget(self._make_temp_panel())
+        ctrl_layout.addWidget(self._make_pressure_panel())
         ctrl_layout.addWidget(self._make_action_panel())
         ctrl_layout.addStretch()
         scroll.setWidget(ctrl_container)
@@ -344,6 +388,49 @@ class MainWindow(QMainWindow):
 
         return group
 
+    def _make_pressure_panel(self) -> QGroupBox:
+        group = QGroupBox("압력 센서 (USB-6001)")
+        layout = QGridLayout(group)
+        row = 0
+
+        self._press_use_check = QCheckBox("압력 측정 사용")
+        self._press_use_check.setChecked(False)
+        layout.addWidget(self._press_use_check, row, 0, 1, 2)
+        row += 1
+
+        layout.addWidget(QLabel("장치명"), row, 0)
+        self._press_dev_edit = QLineEdit(DEFAULT_PRESS_DEV)
+        layout.addWidget(self._press_dev_edit, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("채널 (ai)"), row, 0)
+        self._press_ch_edit = QLineEdit("0")
+        self._press_ch_edit.setPlaceholderText("예: 0 또는 0, 1")
+        layout.addWidget(self._press_ch_edit, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("출력 전압 (V min,max)"), row, 0)
+        self._press_volt_edit = QLineEdit("0, 10")
+        layout.addWidget(self._press_volt_edit, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("압력 범위 (bar, 채널순)"), row, 0)
+        self._press_range_edit = QLineEdit("0:10")
+        self._press_range_edit.setPlaceholderText("예: 0:10  또는  -1:0, 0:10")
+        layout.addWidget(self._press_range_edit, row, 1)
+        row += 1
+
+        layout.addWidget(QLabel("측정 주기 (s)"), row, 0)
+        self._press_interval_edit = QLineEdit("1")
+        layout.addWidget(self._press_interval_edit, row, 1)
+        row += 1
+
+        self._press_label = QLabel("압력: —")
+        self._press_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self._press_label, row, 0, 1, 2)
+
+        return group
+
     def _make_action_panel(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -441,6 +528,12 @@ class MainWindow(QMainWindow):
             "temp_channels": _parse_int_list(self._temp_ch_edit.text()),
             "temp_tc_type": self._temp_tc_combo.currentData(),
             "temp_interval": float(self._temp_interval_edit.text() or DEFAULT_TEMP_INTERVAL),
+            "press_use": self._press_use_check.isChecked(),
+            "press_dev": self._press_dev_edit.text().strip(),
+            "press_channels": _parse_int_list(self._press_ch_edit.text()),
+            "press_volt": _parse_float_list(self._press_volt_edit.text()),
+            "press_ranges": _parse_ranges(self._press_range_edit.text()),
+            "press_interval": float(self._press_interval_edit.text() or DEFAULT_PRESS_INTERVAL),
             "use_4492": use_4492,
             "mock": self._mock_check.isChecked(),
             "dev4464": self._dev4464_edit.text(),
@@ -543,6 +636,26 @@ class MainWindow(QMainWindow):
             logger.info("온도 센서 구성: %s ai%s, %s형 열전대",
                         cfg.get("temp_dev"), self._temp_channels, cfg.get("temp_tc_type"))
 
+        # 압력 센서(USB-6001) — 저속 별도 폴링. 진동 스트림과 무관.
+        self._pressure_daq = None
+        self._pressure_interval = float(cfg.get("press_interval", DEFAULT_PRESS_INTERVAL))
+        self._pressure_channels = list(cfg.get("press_channels", []))
+        self._pressure_ranges = list(cfg.get("press_ranges", []))
+        self._pressure_write_count = 0
+        self._pressure_csv_path = None
+        if cfg.get("press_use") and not cfg.get("mock") and self._pressure_channels:
+            volt = cfg.get("press_volt", [0.0, 10.0])
+            vmin, vmax = (volt + [0.0, 10.0])[:2]
+            self._pressure_daq = USB6001Pressure(
+                device_name=cfg.get("press_dev", DEFAULT_PRESS_DEV),
+                channels=self._pressure_channels,
+                vmin=vmin, vmax=vmax,
+                ranges=self._pressure_ranges,
+            )
+            logger.info("압력 센서 구성: %s ai%s, %.1f-%.1fV, 범위%s",
+                        cfg.get("press_dev"), self._pressure_channels, vmin, vmax,
+                        self._pressure_ranges)
+
     def _on_connect(self):
         try:
             cfg = self._read_config()
@@ -608,6 +721,14 @@ class MainWindow(QMainWindow):
         if ti >= 0:
             self._temp_tc_combo.setCurrentIndex(ti)
         self._temp_interval_edit.setText(_fmt(cfg.get("temp_interval", DEFAULT_TEMP_INTERVAL)))
+        # 압력
+        self._press_use_check.setChecked(bool(cfg.get("press_use", False)))
+        self._press_dev_edit.setText(cfg.get("press_dev", DEFAULT_PRESS_DEV))
+        self._press_ch_edit.setText(", ".join(str(c) for c in cfg.get("press_channels", [0])))
+        pv = cfg.get("press_volt", [0.0, 10.0])
+        self._press_volt_edit.setText(", ".join(_fmt(x) for x in pv))
+        self._press_range_edit.setText(", ".join(f"{_fmt(a)}:{_fmt(b)}" for a, b in cfg.get("press_ranges", [(0.0, 10.0)])))
+        self._press_interval_edit.setText(_fmt(cfg.get("press_interval", DEFAULT_PRESS_INTERVAL)))
         self._mock_check.setChecked(bool(cfg.get("mock", True)))
         enabled = set(cfg.get("enabled_indices", []))
         for i, cb in enumerate(self._ch_checks):
@@ -653,6 +774,9 @@ class MainWindow(QMainWindow):
         # 온도 모니터 시작 (사용 설정 시)
         if self._temp_daq is not None:
             self._temp_monitor.start(self._temp_daq, self._temp_interval)
+        # 압력 모니터 시작 (사용 설정 시)
+        if self._pressure_daq is not None:
+            self._pressure_monitor.start(self._pressure_daq, self._pressure_interval)
         self._start_btn.setText("■ 정지")
         self._save_btn.setEnabled(True)
         logger.info("수집 시작: DAQ=%s, 채널=%s", type(self._daq).__name__, self._enabled_indices)
@@ -670,9 +794,12 @@ class MainWindow(QMainWindow):
         if self._collector:
             self._collector.stop()
         self._temp_monitor.stop()
-        # 온도 CSV 최신본 NAS로 최종 전송(정지 시 flush)
+        self._pressure_monitor.stop()
+        # 온도/압력 CSV 최신본 NAS로 최종 전송(정지 시 flush)
         if self._nas_dir and self._temp_csv_path is not None:
             nas_uploader.enqueue([self._temp_csv_path], self._nas_dir, delete_after=False)
+        if self._nas_dir and self._pressure_csv_path is not None:
+            nas_uploader.enqueue([self._pressure_csv_path], self._nas_dir, delete_after=False)
         self._start_btn.setText("▶ 시작")
         logger.info("수집 정지%s", "" if manual else " (오류)")
 
@@ -734,6 +861,31 @@ class MainWindow(QMainWindow):
     def _on_temp_error(self, msg: str):
         logger.error("온도 측정 오류: %s", msg)
         self._temp_label.setText(f"온도: 오류 ({msg[:40]})")
+
+    def _on_pressure(self, timestamp, pressures):
+        """압력 모니터 슬롯 (메인 스레드). 라벨 표시 + 일자별 CSV 로그 + NAS 전송."""
+        chs = self._pressure_channels
+        parts = [f"ai{chs[i]}: {pressures[i]:.3f}bar" for i in range(min(len(chs), len(pressures)))]
+        self._press_label.setText("압력  " + "   ".join(parts))
+        try:
+            self._temp_save_dir.mkdir(parents=True, exist_ok=True)
+            path = self._temp_save_dir / ("pressure_%s.csv" % timestamp.strftime("%Y%m%d"))
+            is_new = not path.exists()
+            with path.open("a", encoding="utf-8") as f:
+                if is_new:
+                    f.write("timestamp," + ",".join(f"ai{ch}_bar" for ch in chs) + "\n")
+                cells = [f"{pressures[i]:.5f}" if i < len(pressures) else "" for i in range(len(chs))]
+                f.write(timestamp.strftime("%Y-%m-%d %H:%M:%S") + "," + ",".join(cells) + "\n")
+            self._pressure_csv_path = path
+            self._pressure_write_count += 1
+            if self._nas_dir and self._pressure_write_count % PRESS_NAS_EVERY == 0:
+                nas_uploader.enqueue([path], self._nas_dir, delete_after=False)
+        except Exception as exc:
+            logger.warning("압력 로그 저장 실패: %s", exc)
+
+    def _on_pressure_error(self, msg: str):
+        logger.error("압력 측정 오류: %s", msg)
+        self._press_label.setText(f"압력: 오류 ({msg[:40]})")
 
     def _safe_plot(self, fn, name: str) -> None:
         """플롯 갱신을 보호 실행. pyqtgraph TypeError(Python 3.14+SIP)가

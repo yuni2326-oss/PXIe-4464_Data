@@ -18,6 +18,7 @@ try:
         ThermocoupleType,
         CJCSource,
         TemperatureUnits,
+        TerminalConfiguration,
         Edge,
     )
     from nidaqmx.stream_readers import AnalogMultiChannelReader
@@ -344,6 +345,65 @@ class PXIe4353:
                 self._task.close()
             except Exception as exc:
                 logger.warning("PXIe4353 task cleanup error (ignored): %s", exc)
+            finally:
+                self._task = None
+
+
+class USB6001Pressure:
+    """NI USB-6001 전압입력으로 압력 트랜스미터(3선 0–10V 등) 측정 (저속·온디맨드).
+
+    채널별 선형 매핑:
+        pressure[bar] = pmin + (V - vmin) / (vmax - vmin) * (pmax - pmin)
+    예) 0~10bar / 0–10V:  vmin=0,vmax=10, pmin=0,pmax=10 → P = V
+
+    read() → shape (n_channels,) bar 배열 (1회 온디맨드 읽기, RSE 모드).
+    """
+
+    def __init__(self, device_name: str = "Dev1", channels=(0,),
+                 vmin: float = 0.0, vmax: float = 10.0, ranges=None):
+        if not _NIDAQMX_AVAILABLE:
+            raise RuntimeError("nidaqmx is not installed")
+        self._device_name = device_name
+        self._channels = [int(c) for c in channels]
+        self._vmin = float(vmin)
+        self._vmax = float(vmax)
+        # ranges: 채널 순서대로 (pmin, pmax). 부족하면 (0,10)으로 채움.
+        ranges = list(ranges or [])
+        self._ranges = [tuple(map(float, ranges[i])) if i < len(ranges) else (0.0, 10.0)
+                        for i in range(len(self._channels))]
+        self._task: Optional[nidaqmx.Task] = None
+
+    def start(self) -> None:
+        self._task = nidaqmx.Task()
+        for ch in self._channels:
+            self._task.ai_channels.add_ai_voltage_chan(
+                physical_channel=f"{self._device_name}/ai{ch}",
+                terminal_config=TerminalConfiguration.RSE,
+                min_val=-10.0, max_val=10.0,
+            )
+        # 샘플클럭 미설정 = 온디맨드 단일 읽기
+        self._task.start()
+
+    def read(self) -> np.ndarray:
+        if self._task is None:
+            raise RuntimeError("USB6001Pressure not started. Call start() first.")
+        vals = self._task.read()
+        if not isinstance(vals, list):
+            vals = [vals]
+        v = np.array(vals, dtype=np.float64)
+        span = (self._vmax - self._vmin) or 1.0
+        out = np.empty_like(v)
+        for i, (pmin, pmax) in enumerate(self._ranges):
+            out[i] = pmin + (v[i] - self._vmin) / span * (pmax - pmin)
+        return out
+
+    def stop(self) -> None:
+        if self._task is not None:
+            try:
+                self._task.stop()
+                self._task.close()
+            except Exception as exc:
+                logger.warning("USB6001Pressure task cleanup error (ignored): %s", exc)
             finally:
                 self._task = None
 
