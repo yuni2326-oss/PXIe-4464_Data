@@ -121,8 +121,8 @@ def main():
         _patch_pyqtgraph_hover()
         app = QApplication(sys.argv)
         window = MainWindow()
-        window.resize(1400, 800)
-        window.show()
+        window.resize(1500, 950)      # 최대화 해제 시 복원 크기
+        window.showMaximized()        # 시작 시 전체 화면 → 긴 메뉴가 잘리지 않음
         if autostart:
             # 이벤트 루프 시작 후 저장된 초기 실행조건으로 자동 재개
             QTimer.singleShot(1000, window.autostart)

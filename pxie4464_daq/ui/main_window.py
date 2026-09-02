@@ -166,12 +166,16 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
-        # 좌측: 스크롤 가능한 제어 패널
+        # 좌측: 스크롤 가능한 제어 패널 (센서 패널이 많아 세로로 길어짐 → 세로 스크롤)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(280)
+        scroll.setFixedWidth(300)      # 세로 스크롤바 폭까지 고려해 여유
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         ctrl_container = QWidget()
         ctrl_layout = QVBoxLayout(ctrl_container)
+        ctrl_layout.setSpacing(6)
+        ctrl_layout.setContentsMargins(6, 6, 6, 6)
         ctrl_layout.addWidget(self._make_device_panel())
         ctrl_layout.addWidget(self._make_channel_panel())
         ctrl_layout.addWidget(self._make_temp_panel())
