@@ -152,6 +152,7 @@ class MainWindow(QMainWindow):
         self._pressure_monitor.failed.connect(self._on_pressure_error)
         self._pressure_channels: List[int] = []
         self._pressure_ranges: List = []
+        self._pressure_labels: List[str] = []
         self._pressure_interval = DEFAULT_PRESS_INTERVAL
         self._pressure_write_count = 0
         self._pressure_csv_path = None
@@ -420,6 +421,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._press_range_edit, row, 1)
         row += 1
 
+        # 채널 라벨 — CSV 컬럼명·표시명(채널순). CSV는 {라벨}_bar 로 기록.
+        layout.addWidget(QLabel("채널 라벨"), row, 0)
+        self._press_label_edit = QLineEdit("p_discharge, p_suction")
+        self._press_label_edit.setPlaceholderText("예: p_discharge, p_suction")
+        layout.addWidget(self._press_label_edit, row, 1)
+        row += 1
+
         layout.addWidget(QLabel("측정 주기 (s)"), row, 0)
         self._press_interval_edit = QLineEdit("1")
         layout.addWidget(self._press_interval_edit, row, 1)
@@ -533,6 +541,7 @@ class MainWindow(QMainWindow):
             "press_channels": _parse_int_list(self._press_ch_edit.text()),
             "press_volt": _parse_float_list(self._press_volt_edit.text()),
             "press_ranges": _parse_ranges(self._press_range_edit.text()),
+            "press_labels": [s.strip() for s in self._press_label_edit.text().split(",") if s.strip()],
             "press_interval": float(self._press_interval_edit.text() or DEFAULT_PRESS_INTERVAL),
             "use_4492": use_4492,
             "mock": self._mock_check.isChecked(),
@@ -641,6 +650,7 @@ class MainWindow(QMainWindow):
         self._pressure_interval = float(cfg.get("press_interval", DEFAULT_PRESS_INTERVAL))
         self._pressure_channels = list(cfg.get("press_channels", []))
         self._pressure_ranges = list(cfg.get("press_ranges", []))
+        self._pressure_labels = list(cfg.get("press_labels", []))
         self._pressure_write_count = 0
         self._pressure_csv_path = None
         if cfg.get("press_use") and not cfg.get("mock") and self._pressure_channels:
@@ -728,6 +738,7 @@ class MainWindow(QMainWindow):
         pv = cfg.get("press_volt", [0.0, 10.0])
         self._press_volt_edit.setText(", ".join(_fmt(x) for x in pv))
         self._press_range_edit.setText(", ".join(f"{_fmt(a)}:{_fmt(b)}" for a, b in cfg.get("press_ranges", [(0.0, 10.0)])))
+        self._press_label_edit.setText(", ".join(cfg.get("press_labels", ["p_discharge", "p_suction"])))
         self._press_interval_edit.setText(_fmt(cfg.get("press_interval", DEFAULT_PRESS_INTERVAL)))
         self._mock_check.setChecked(bool(cfg.get("mock", True)))
         enabled = set(cfg.get("enabled_indices", []))
@@ -862,10 +873,19 @@ class MainWindow(QMainWindow):
         logger.error("온도 측정 오류: %s", msg)
         self._temp_label.setText(f"온도: 오류 ({msg[:40]})")
 
+    def _press_col_label(self, i: int) -> str:
+        """i번째 압력 채널의 라벨(없으면 ai{ch})."""
+        labels = self._pressure_labels
+        if i < len(labels) and labels[i]:
+            return labels[i]
+        chs = self._pressure_channels
+        return f"ai{chs[i]}" if i < len(chs) else f"ch{i}"
+
     def _on_pressure(self, timestamp, pressures):
         """압력 모니터 슬롯 (메인 스레드). 라벨 표시 + 일자별 CSV 로그 + NAS 전송."""
         chs = self._pressure_channels
-        parts = [f"ai{chs[i]}: {pressures[i]:.3f}bar" for i in range(min(len(chs), len(pressures)))]
+        parts = [f"{self._press_col_label(i)}: {pressures[i]:.3f}bar"
+                 for i in range(min(len(chs), len(pressures)))]
         self._press_label.setText("압력  " + "   ".join(parts))
         try:
             self._temp_save_dir.mkdir(parents=True, exist_ok=True)
@@ -873,7 +893,7 @@ class MainWindow(QMainWindow):
             is_new = not path.exists()
             with path.open("a", encoding="utf-8") as f:
                 if is_new:
-                    f.write("timestamp," + ",".join(f"ai{ch}_bar" for ch in chs) + "\n")
+                    f.write("timestamp," + ",".join(f"{self._press_col_label(i)}_bar" for i in range(len(chs))) + "\n")
                 cells = [f"{pressures[i]:.5f}" if i < len(pressures) else "" for i in range(len(chs))]
                 f.write(timestamp.strftime("%Y-%m-%d %H:%M:%S") + "," + ",".join(cells) + "\n")
             self._pressure_csv_path = path
