@@ -438,6 +438,7 @@ class MainWindow(QMainWindow):
         row += 1
 
         self._press_label = QLabel("압력: —")
+        self._press_label.setWordWrap(True)   # 채널이 많아도 줄바꿈되어 모두 표시
         self._press_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(self._press_label, row, 0, 1, 2)
 
@@ -888,9 +889,9 @@ class MainWindow(QMainWindow):
     def _on_pressure(self, timestamp, pressures):
         """압력 모니터 슬롯 (메인 스레드). 라벨 표시 + 일자별 CSV 로그 + NAS 전송."""
         chs = self._pressure_channels
-        parts = [f"{self._press_col_label(i)}: {pressures[i]:.3f}bar"
+        parts = [f"{self._press_col_label(i)}: {pressures[i]:.3f} bar"
                  for i in range(min(len(chs), len(pressures)))]
-        self._press_label.setText("압력  " + "   ".join(parts))
+        self._press_label.setText("\n".join(parts))   # 채널별 줄바꿈 → 둘 다 한번에 표시
         try:
             self._temp_save_dir.mkdir(parents=True, exist_ok=True)
             path = self._temp_save_dir / ("pressure_%s.csv" % timestamp.strftime("%Y%m%d"))
