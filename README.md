@@ -78,10 +78,18 @@ pxie4464_daq/
 │   ├── fft_plot.py            # 실시간 FFT (0–5 kHz)
 │   ├── anomaly_plot.py        # 이상 점수 히스토리
 │   └── status_light.py        # 채널별 상태 표시등
-└── main.py                    # 진입점 (로깅·예외훅·pyqtgraph 패치·--autostart)
+├── main.py                    # 상시 모니터링 진입점 (--autostart)
+├── impact_main.py             # 임팩트 해머 시험 진입점 (별도 프로그램)
+├── app_common.py              # 두 프로그램 공통: 로깅·예외훅·pyqtgraph 패치
+├── device/impact_daq.py       # 해머(IEPE 힘)·마이크·가속도 단일 태스크 + 모의 장치
+├── acquisition/impact_worker.py # 트리거 처리를 수집 스레드에서
+├── analysis/impact.py         # 트리거 캡처·펄스·대역폭·H1 FRF·코히어런스·피크
+├── storage/impact_saver.py    # 타격별 .npz + impact_log.csv
+└── ui/impact_window.py        # 임팩트 시험 창
 supervisor.py                  # 외부 감시: 비정상 종료/hang 시 새 프로세스 재시작
 run_supervised.bat             # supervisor 실행 런처
-tests/                         # pytest 단위 테스트 (27 passed)
+run_impact.bat                 # 임팩트 해머 시험 실행
+tests/                         # pytest 단위 테스트 (42 passed)
 tools/disable_sleep.ps1        # 화면보호기·절전 비활성화 스크립트
 logs/  results/  config/       # 런타임 산출물 (gitignore)
 ```
@@ -162,6 +170,41 @@ run_supervised.bat          REM = python supervisor.py
 - `tools/disable_sleep.ps1`을 관리자 권한으로 실행해 화면보호기·절전·USB 선택적 절전·PCIe 링크 전원관리를 끈다. (절전 진입 시 PXI 버스가 끊기며 "argument 5" 오류 유발)
 - 로그: `logs/daq.log`(앱), `logs/supervisor.log`(감시), `logs/heartbeat.txt`(생존 신호). 저장 성공/실패·디스크 여유·재시작 이력 확인 가능.
 
+## 임팩트 해머 시험 (별도 프로그램)
+
+임펠러·쿠폰 해머 시험(EX2 계획서 §1·§4·§6)용. 상시 모니터링과 **같은 DAQ를 동시에 쓸 수 없으므로
+상시 모니터링 창을 먼저 정상 종료**한다(정상 종료하면 supervisor도 함께 끝난다). 시험 후에는
+`run_supervised.bat`로 모니터링을 다시 시작한다.
+
+```bat
+run_impact.bat              REM = python -m pxie4464_daq.impact_main
+```
+
+| 항목 | 기본값 | 비고 |
+|------|--------|------|
+| 해머 | **CH7** (4492 ai3), LC-00KE, **20.348 mV/N**, ±200 N, IEPE 4 mA | 사용자 교정 감도 |
+| 마이크 (주 응답) | CH6 (4492 ai2), 50 mV/Pa, 최대 130 dB | |
+| 가속도계 (기준·틀 감시) | CH4·CH5 (4492 ai0·1), 10.2 mV/(m/s²) | CH0–3을 넣으면 4464와 다중 장치 동기 |
+| 샘플레이트 | **204.8 kS/s** | 계획서 권장 (51.2·102.4도 선택) |
+| 트리거 | 해머 \|F\| ≥ **2 N**, 프리트리거 20 ms, 기록 **4 s** | 계획서 "타격당 ≥ 4 s" |
+| 저장 | `C:\Project\Data_aquistion\results\<하위폴더>\` | NAS도 같은 하위폴더로 업로드 |
+
+- 모든 채널을 **한 DAQmx 태스크**로 읽어 해머·응답이 샘플 단위로 맞는다(위상 비교 가능).
+  DSA 장치는 물리 채널 오름차순으로만 태스크에 넣을 수 있어(-200618) 내부에서 정렬 후 되돌린다.
+- **타격 1회 = `.npz` 1개**: `data`(float32, [해머, 마이크, 가속도…] × 샘플, N·Pa·m/s²) + 메타데이터
+  (샘플레이트, 트리거 위치, 채널·단위·감도, 세션·위치·마이크 위치·타격 번호, 해머 모델·팁,
+  온도, 피크 힘·펄스 폭·힘 대역폭(−5/−10/−20 dB), 이중 타격·과부하 판정).
+  읽기: `from pxie4464_daq.analysis.impact import load_hit; d = load_hit(path)`
+- `impact_log.csv`: 타격 목록과 상태 — `accepted`(평균·목표 포함), `flagged`(자동: 이중 타격·과부하),
+  `rejected`(직전 타격 제외). 다시 켜도 이어 쓰고 번호가 이어진다.
+- 화면: 해머 펄스, 응답 시간이력, 힘 스펙트럼(대역폭), 위치별 평균 **H1 FRF + 코히어런스**,
+  피크 목록(**주파수·크기·위상** — 마이크 고정·해머 이동 시 베인별 위상 부호 패턴으로 h 판별).
+- 실험 정보(세션·위치·마이크 위치)는 **타격 순간 값**으로 기록되므로 기록 중(4 s)에 다음 위치로
+  바꿔도 섞이지 않는다. 위치 프리셋: 뒤판 베인 1–6 × ξ0.3·0.6, 앞판 베인 1–6 × ξ0.6, 흡입구 테,
+  쿠폰 클램프 블록. "다음 위치 ▶"로 차례로 넘긴다.
+- 온도(PXIe-4353)는 10초마다 읽어 타격마다 함께 저장한다(계획서 "온도 기록").
+- 로그: `logs/impact.log`. 설정은 `config/impact_session.json`에 남아 다음 실행 때 복원된다.
+
 ## 안정성 개선 이력 (장시간 운전)
 
 수일 연속 운전 중 발견된 문제들과 해결 내역입니다.
@@ -182,7 +225,7 @@ run_supervised.bat          REM = python supervisor.py
 ## 테스트
 
 ```bash
-pytest tests/ -v        # 27 passed, 1 skipped (하드웨어 테스트)
+pytest tests/ -v        # 42 passed, 1 skipped (하드웨어 테스트)
 ```
 
 ## 참고
